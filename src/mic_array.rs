@@ -1,7 +1,7 @@
 use crate::Vector3;
 
 /// A Microphone array with `M` elements.
-struct MicArray<const M: usize> {
+pub struct MicArray<const M: usize> {
     /// Microphone positions, indexed by channels from the audio stream
     pub mic_pos: [Vector3; M],
 }
@@ -66,7 +66,7 @@ impl<const M: usize> MicArray<M> {
     }
 
     pub fn get_distance_from(&self, r: &Vector3) -> [f64; M] {
-        self.mic_pos.map(|p_m| (r - p_m).norm().clone())
+        self.mic_pos.map(|p_m| (r - p_m).norm())
     }
 }
 
@@ -79,10 +79,7 @@ impl MicArray<16> {
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        Vector3, distance_to_delay,
-        mic_array::{self, MicArray},
-    };
+    use crate::{Vector3, distance_to_delay, mic_array::MicArray};
 
     #[test]
     fn test_uma16_geometry() {
@@ -111,13 +108,36 @@ mod test {
 
     #[test]
     fn test_relative_delay() {
-        let r_source = Vector3::new(-1.0, 1.0, 2.0);
-        // Place it at 10m away
-        let r_source = r_source / r_source.norm() * 10.0;
+        // Distance of source from origin in meters
+        const DISTANCE: f64 = 100.0;
 
         let uma16 = MicArray::uma16();
+        let p = uma16.mic_pos;
 
-        let r_mk = uma16.get_distance_from(&r_source);
-        let tau_m = r_mk.map(|r| distance_to_delay(r));
+        let direction = Vector3::new(-1.0, 1.0, 2.0);
+
+        // Unit vector in direction
+        let u_k = direction / direction.norm();
+        // Rescale to be DISTANCE away
+        let r_k = u_k * DISTANCE;
+
+        let r_mk = uma16.get_distance_from(&r_k);
+        let tau_mk = r_mk.map(distance_to_delay);
+
+        let tau_mk_approx = p
+            .map(|p_m| p_m.dot(&u_k))
+            .map(distance_to_delay)
+            .map(|x| -1.0 * x + distance_to_delay(DISTANCE));
+
+        println!("tau_mk: {tau_mk:#?}, tau_mk_approx: {tau_mk_approx:#?}");
+
+        for m in 0..p.len() {
+            assert!(
+                (tau_mk[m] - tau_mk_approx[m]).abs() < 1e-6,
+                "mic {m}: {} vs {}",
+                tau_mk[m],
+                tau_mk_approx[m]
+            );
+        }
     }
 }

@@ -4,6 +4,7 @@ pub mod mic_array;
 pub type Vector3 = nalgebra::Vector3<f64>;
 
 /// Speed of sound
+// TODO(julian): Notation says SPEED_OF_SOUND, align it 
 pub const C_SOUND: f64 = 343.0;
 
 pub fn distance_to_delay(distance: f64) -> f64 {
