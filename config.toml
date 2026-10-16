@@ -1,0 +1,14 @@
+sample_rate = 48000
+duration_s = 2.0
+
+[mic_noise]
+seed = 1
+level_db = 54.0
+
+[[sources]]
+pos = [0.5, 0.3, 2.0]
+signal = { type = "sine", level_db = 91.0, freq_hz = 1000.0, phase_rad = 0.0 }
+
+[[sources]]
+pos = [-0.4, 0.0, 2.0]
+signal = { type = "noise", seed = 123, n_components = 200, f_lo_hz = 1000.0, f_hi_hz = 4000.0, level_db = 91.0 }

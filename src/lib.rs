@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod mic_array;
+pub mod simulator;
 
 pub type Vector3 = nalgebra::Vector3<f64>;
 
