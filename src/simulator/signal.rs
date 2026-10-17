@@ -3,16 +3,7 @@ use std::f64::consts::{PI, SQRT_2};
 use rand::{RngExt, SeedableRng, rngs::ChaCha8Rng};
 use serde::Deserialize;
 
-/// Reference sound pressure in air, 20µPa
-const P_REF: f64 = 20e-6;
-
-/// Convert a Sound Pressure Level in dB to a pressure value in Pa
-pub fn level_to_pressure(level_db: f64) -> f64 {
-    // Level is computed as 20*log10(p_rms / p_ref), where p_ref = 20µPa
-    // Inverted: 10^(level/20) * p_ref
-
-    10f64.powf(level_db / 20.0) * P_REF
-}
+use crate::simulator::level_to_pressure;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -62,6 +53,7 @@ impl Sine {
         }
     }
 
+    /// Get Sine signal value at time `t`
     pub fn eval(&self, t: f64) -> f64 {
         self.amplitude * (2.0 * PI * self.freq_hz * t + self.phase_rad).sin()
     }
@@ -79,25 +71,36 @@ impl From<SineParams> for Sine {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct NoiseParams {
+    /// RNG Seed for reproducible noise
     pub seed: u64,
+    /// Number of noise components `Q`
     pub n_components: usize,
+    /// Lower frequency limit (inclusive), Hz
     pub f_lo_hz: f64,
+    /// Upper frequency limit (inclusive), Hz
     pub f_hi_hz: f64,
     /// Total level in dB SPL at 1 m
     pub level_db: f64,
 }
 
+/// Noise constructed from a sum of `Sine`s
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "NoiseParams")]
 pub struct Noise {
-    pub params: NoiseParams, // keep it for Serialize (`into = ...`) and debugging
-    pub components: Vec<Sine>, // amplitude, freq, phase per component
+    /// Parameters that were used for constructing this instance.
+    /// Kept for debugging
+    _params: NoiseParams,
+    /// `Sine`s that comprise the noise
+    components: Vec<Sine>,
 }
 
 impl From<NoiseParams> for Noise {
     fn from(params: NoiseParams) -> Self {
-        assert!(params.n_components > 0);
-        assert!(params.f_lo_hz < params.f_hi_hz);
+        assert!(params.n_components > 0, "n_components must be >0");
+        assert!(
+            params.f_lo_hz < params.f_hi_hz,
+            "f_hi_hz must be higher than f_lo_hz"
+        );
 
         let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
         let n_components = params.n_components;
@@ -115,11 +118,15 @@ impl From<NoiseParams> for Noise {
             })
             .collect();
 
-        Noise { params, components }
+        Noise {
+            _params: params,
+            components,
+        }
     }
 }
 
 impl Noise {
+    /// Get noise signal value at time `t`
     pub fn eval(&self, t: f64) -> f64 {
         let mut res = 0.0;
         for component in &self.components {
@@ -131,6 +138,8 @@ impl Noise {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::simulator::P_REF;
 
     use super::*;
 
@@ -169,7 +178,7 @@ mod tests {
             panic!("expected Signal::Sine, got {s:?}");
         };
         // 0 dB SPL: RMS = 20 µPa, A = sqrt(2) * RMS
-        let expected = std::f64::consts::SQRT_2 * 20e-6;
+        let expected = SQRT_2 * P_REF;
         assert!((sine.amplitude - expected).abs() < expected * TOL);
         assert_eq!(sine.freq_hz, 1000.0);
         assert_eq!(sine.phase_rad, 0.5);
@@ -180,6 +189,12 @@ mod tests {
         fn pressure_to_level(pressure: f64) -> f64 {
             20.0 * (pressure / P_REF).log10()
         }
+
+        assert_eq!(
+            level_to_pressure(0.0),
+            P_REF,
+            "0.0 dB should match the reference pressure"
+        );
 
         for pressure in [20e-6, 1e-3, 1.0, 10.0] {
             let level = pressure_to_level(pressure);
@@ -192,40 +207,82 @@ mod tests {
         }
     }
 
+    const NOISE_PARAMS: NoiseParams = NoiseParams {
+        seed: 4234,
+        level_db: 60.0,
+        n_components: 10,
+        f_lo_hz: 1000.0,
+        f_hi_hz: 4000.0,
+    };
+
+    #[test]
+    fn noise_frequencies_in_band() {
+        let noise = Noise::from(NOISE_PARAMS);
+
+        for component in &noise.components {
+            assert!(
+                (NOISE_PARAMS.f_lo_hz..=NOISE_PARAMS.f_hi_hz).contains(&component.freq_hz),
+                "frequency {} out of band",
+                component.freq_hz
+            );
+        }
+    }
+
+    #[test]
+    fn noise_same_seed() {
+        let noise = Noise::from(NOISE_PARAMS);
+        let noise_2 = Noise::from(NOISE_PARAMS);
+
+        assert_eq!(noise.components, noise_2.components);
+    }
+
+    #[test]
+    fn noise_different_seed() {
+        let noise = Noise::from(NOISE_PARAMS);
+        let noise_2 = Noise::from(NoiseParams {
+            seed: NOISE_PARAMS.seed + 1,
+            ..NOISE_PARAMS
+        });
+
+        assert_ne!(noise.components, noise_2.components);
+    }
+
     #[test]
     fn noise_power() {
-        let noise_params = NoiseParams {
-            seed: 1234,
-            level_db: 60.0,
-            n_components: 10,
-            f_lo_hz: 1000.0,
-            f_hi_hz: 4000.0,
-        };
+        // Sampling frequency in Hz
+        const F_SAMPLE: f64 = 48_000.0;
 
+        let noise_params = NOISE_PARAMS;
         let noise = Noise::from(noise_params);
 
-        // Ensure noise components' frequencies are in the defined range
-        assert!(noise.components.iter().all(|component| {
-            (noise_params.f_lo_hz..=noise_params.f_hi_hz).contains(&component.freq_hz)
-        }));
+        let p_signal: f64 = noise
+            .components
+            .iter()
+            .map(|c| c.amplitude.powi(2) / 2.0)
+            .sum();
 
-        let noise_samples: Vec<_> = (0..100000).map(|t| noise.eval(t as f64)).collect();
+        let expected_p_signal = level_to_pressure(noise_params.level_db).powi(2);
 
-        let mean_square =
-            noise_samples.iter().map(|n| n.powi(2)).sum::<f64>() / noise_samples.len() as f64;
-
-        let pressure_squared = level_to_pressure(noise_params.level_db).powi(2);
         assert!(
-            (mean_square - pressure_squared).abs() < 10e-8,
-            "expected pressure_squared {pressure_squared}, got {mean_square}"
+            (p_signal - expected_p_signal).abs() < 1e-12,
+            "signal power {p_signal} deviates from the setting {expected_p_signal}"
         );
 
-        // Generate new noise from the same seed
-        let noise_2 = Noise::from(noise_params);
+        let n_samples = 1_000_000;
+        let mean_square = (0..n_samples)
+            .map(|t| noise.eval(t as f64 / F_SAMPLE))
+            .map(|n| n.powi(2))
+            .sum::<f64>()
+            / n_samples as f64;
 
+        // Check that the deviation is at most 2% of pressure_squared
+        //
+        // Since noise is generated by the RNG, the actual power depends on
+        // the frequency distribution. So the deviation depends on the seed
+        // and this tolerance might fail for a different seed.
         assert!(
-            noise.components == noise_2.components,
-            "noise_2's components should match noise's components for the same seed"
-        )
+            (mean_square - expected_p_signal).abs() < expected_p_signal * 0.02,
+            "expected expected_p_signal {expected_p_signal}, got {mean_square}"
+        );
     }
 }

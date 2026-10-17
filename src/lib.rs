@@ -5,16 +5,18 @@ pub mod simulator;
 pub type Vector3 = nalgebra::Vector3<f64>;
 
 /// Speed of sound
-// TODO(julian): Notation says SPEED_OF_SOUND, align it 
+// TODO(julian): Notation says SPEED_OF_SOUND, align it
 pub const C_SOUND: f64 = 343.0;
 
 pub fn distance_to_delay(distance: f64) -> f64 {
     distance / C_SOUND
 }
 
-pub trait FrameSource {
-    fn sample_rate(&self) -> u32;
-    fn channels(&self) -> usize;
+pub trait FrameSource<const M: usize> {
+    fn sample_rate(&self) -> f64;
+    fn channels(&self) -> usize {
+        M
+    }
     /// Interleaved, len = frames * channels; returns frames read.
     fn read(&mut self, buf: &mut [f32]) -> std::io::Result<usize>;
 }

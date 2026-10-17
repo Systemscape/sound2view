@@ -1,7 +1,7 @@
 sample_rate = 48000
 duration_s = 2.0
 
-[mic_noise]
+[mic_noise_params]
 seed = 1
 level_db = 54.0
 
