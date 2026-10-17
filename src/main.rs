@@ -8,10 +8,16 @@ use audio2video_rs::{
 
 /// Usage: `audio2video-rs [scene.toml]`, defaults to `config.toml`.
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
-    let scene: Scene = toml::from_str(&fs::read_to_string(&path)?)?;
+    let path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    println!("Reading scene from {path}");
+    let scene = Scene::from_toml(&fs::read_to_string(&path)?)?;
+    scene.validate();
 
     let sim = Simulator::new(scene, MicArray::uma16());
+    println!("Running simulator...");
     run(sim)
 }
 

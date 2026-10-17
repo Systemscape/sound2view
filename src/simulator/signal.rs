@@ -20,6 +20,18 @@ impl Signal {
             Self::Noise(noise) => noise.eval(t),
         }
     }
+
+    /// Highest frequency contained in the signal, Hz
+    pub fn max_freq(&self) -> f64 {
+        match self {
+            Self::Sine(sine) => sine.freq_hz,
+            Self::Noise(noise) => noise
+                .components
+                .iter()
+                .map(|c| c.freq_hz)
+                .fold(0.0, f64::max),
+        }
+    }
 }
 
 /// Sine as specified in the config.

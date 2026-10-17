@@ -20,16 +20,24 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn from_toml(toml: &String) -> Result<Scene, toml::de::Error> {
-        let scene: Scene = toml::from_str(toml)?;
-        assert!(scene.duration_s > 0.0, "duration must be >0");
-        assert!(scene.sample_rate > 0.0, "sample_rate must be >0");
+    /// Parse a scene from TOML. Does not validate; call `validate()` afterwards.
+    pub fn from_toml(toml: &str) -> Result<Scene, toml::de::Error> {
+        toml::from_str(toml)
+    }
 
-        for source in &scene.sources {
+    /// Panics if the scene is physically invalid.
+    pub fn validate(&self) {
+        assert!(self.duration_s > 0.0, "duration must be >0");
+        assert!(self.sample_rate > 0.0, "sample_rate must be >0");
+
+        for source in &self.sources {
             assert!(source.pos.z > 0.0, "Source z coordinates must be >0");
+            assert!(
+                source.signal.max_freq() < self.sample_rate / 2.0,
+                "max_freq {} must be below sample_rate/2",
+                source.signal.max_freq()
+            );
         }
-
-        Ok(scene)
     }
 }
 

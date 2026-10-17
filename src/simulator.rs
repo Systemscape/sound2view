@@ -43,8 +43,7 @@ pub struct Simulator<const M: usize> {
 
 impl<const M: usize> Simulator<M> {
     pub fn new(scene: Scene, mic_array: MicArray<M>) -> Self {
-        assert!(scene.sample_rate > 0.0, "Samplerate must be >0");
-
+        let _: () = scene.validate();
         let mut sim_sources = Vec::with_capacity(scene.sources.len());
 
         for source in &scene.sources {
@@ -170,7 +169,11 @@ mod tests {
         let mut sim = Simulator::new(test_scene(-1000.0), mic_array.clone());
         let buf = read_all(&mut sim, 1024);
 
-        assert_eq!(buf.len(), N_FRAMES * sim.channels(), "total frames until EOF");
+        assert_eq!(
+            buf.len(),
+            N_FRAMES * sim.channels(),
+            "total frames until EOF"
+        );
 
         for frame in 0..N_FRAMES {
             let t = frame as f64 / SAMPLE_RATE;
