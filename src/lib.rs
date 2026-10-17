@@ -1,8 +1,11 @@
 pub mod camera;
+pub mod covariance;
 pub mod mic_array;
 pub mod simulator;
+pub mod stft;
 
 pub type Vector3 = nalgebra::Vector3<f64>;
+pub type Complex64 = nalgebra::Complex<f64>;
 
 /// Speed of sound
 // TODO(julian): Notation says SPEED_OF_SOUND, align it

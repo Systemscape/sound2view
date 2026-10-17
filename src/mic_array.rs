@@ -8,7 +8,7 @@ pub struct MicArray<const M: usize> {
 }
 
 impl<const M: usize> MicArray<M> {
-    /// Uniform rectangular array in the x-y plane, centred on the origin.
+    /// Uniform rectangular array in the x-y plane, centered on the origin.
     ///
     /// ## Inputs
     /// - `cols`: number of columns
