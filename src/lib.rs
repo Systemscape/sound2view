@@ -18,7 +18,7 @@ pub trait FrameSource<const M: usize> {
         M
     }
     /// Interleaved, len = frames * channels; returns frames read.
-    fn read(&mut self, buf: &mut [f32]) -> std::io::Result<usize>;
+    fn read(&mut self, buf: &mut [f64]) -> std::io::Result<usize>;
 }
 
 pub trait ImageSource {

@@ -19,6 +19,20 @@ pub struct Scene {
     pub sources: Vec<Source>,
 }
 
+impl Scene {
+    pub fn from_toml(toml: &String) -> Result<Scene, toml::de::Error> {
+        let scene: Scene = toml::from_str(toml)?;
+        assert!(scene.duration_s > 0.0, "duration must be >0");
+        assert!(scene.sample_rate > 0.0, "sample_rate must be >0");
+
+        for source in &scene.sources {
+            assert!(source.pos.z > 0.0, "Source z coordinates must be >0");
+        }
+
+        Ok(scene)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Source {
     /// Position in meters relative to center of array frame, z into the scene
@@ -30,9 +44,9 @@ pub struct Source {
 #[derive(Clone, Debug, Deserialize)]
 pub struct MicNoiseParams {
     /// RNG Seed
-    seed: u64,
+    pub seed: u64,
     /// Noise level in dB SPL
-    level_db: f64,
+    pub level_db: f64,
 }
 
 #[derive(Debug, Deserialize)]

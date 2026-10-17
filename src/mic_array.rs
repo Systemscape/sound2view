@@ -1,6 +1,7 @@
 use crate::Vector3;
 
 /// A Microphone array with `M` elements.
+#[derive(Clone, Debug)]
 pub struct MicArray<const M: usize> {
     /// Microphone positions, indexed by channels from the audio stream
     pub mic_pos: [Vector3; M],
