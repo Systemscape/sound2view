@@ -12,18 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "audio2video-rs"
-version = "0.1.0"
-dependencies = [
- "nalgebra",
- "rand",
- "rand_distr",
- "realfft",
- "serde",
- "toml",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +346,18 @@ dependencies = [
  "num-complex",
  "num-traits",
  "wide",
+]
+
+[[package]]
+name = "sound2view"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "rand",
+ "rand_distr",
+ "realfft",
+ "serde",
+ "toml",
 ]
 
 [[package]]
