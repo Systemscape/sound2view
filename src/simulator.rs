@@ -60,7 +60,7 @@ impl<const M: usize> Simulator<M> {
 
         Simulator {
             n: 0,
-            n_total: (scene.duration_s * scene.sample_rate).round() as u64 as u64,
+            n_total: (scene.duration_s * scene.sample_rate).round() as u64,
             sim_sources,
             mic_noise: MicNoise::from(scene.mic_noise_params.clone()),
             scene,

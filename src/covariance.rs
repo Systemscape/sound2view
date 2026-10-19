@@ -127,6 +127,16 @@ mod tests {
 
     #[test]
     #[should_panic]
+    fn estimate_after_reset_panics() {
+        let mut cov = Covariance::<M>::new(N_BINS);
+        cov.accumulate(&snapshots(1.0));
+        Covariance::<M>::new(N_BINS).estimate();
+        cov.reset();
+        cov.estimate();
+    }
+
+    #[test]
+    #[should_panic]
     fn wrong_bin_count_panics() {
         Covariance::<M>::new(N_BINS + 1).accumulate(&snapshots(1.0));
     }

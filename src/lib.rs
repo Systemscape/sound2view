@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod covariance;
 pub mod mic_array;
+pub mod reference;
 pub mod simulator;
 pub mod stft;
 

@@ -32,6 +32,14 @@ impl Signal {
                 .fold(0.0, f64::max),
         }
     }
+
+    /// Get the Signal's components
+    pub fn components(&self) -> &[Sine] {
+        match self {
+            Signal::Sine(sine) => std::slice::from_ref(sine),
+            Signal::Noise(noise) => &noise.components,
+        }
+    }
 }
 
 /// Sine as specified in the config.

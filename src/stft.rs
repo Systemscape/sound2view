@@ -46,6 +46,10 @@ impl Stft {
         self.window.len()
     }
 
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
     pub fn transform(&mut self, frame: &[f64]) -> &[Complex64] {
         assert_eq!(
             frame.len(),
@@ -99,7 +103,7 @@ impl<const M: usize> StftStream<M> {
         assert_eq!(chunk.len() % M, 0, "chunk len must be a multiple of M");
         let fft_len = self.stft.fft_len();
 
-        for frame in chunk.chunks_exact(M) {
+        for frame in chunk.as_chunks::<M>().0 {
             for m in 0..M {
                 self.buf[m][self.fill] = frame[m];
             }
@@ -132,7 +136,7 @@ mod test {
 
     use crate::{
         Complex64, FrameSource, Vector3, distance_to_delay,
-        mic_array::{self, MicArray},
+        mic_array::MicArray,
         simulator::{
             Simulator,
             scene::{MicNoiseParams, Scene, Source},
