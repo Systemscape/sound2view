@@ -1,4 +1,8 @@
-use crate::Vector3;
+use std::f64::consts::PI;
+
+use nalgebra::SVector;
+
+use crate::{Complex64, Vector3, distance_to_delay};
 
 /// A Microphone array with `M` elements.
 #[derive(Clone, Debug)]
@@ -68,6 +72,31 @@ impl<const M: usize> MicArray<M> {
 
     pub fn get_distance_from(&self, r: &Vector3) -> [f64; M] {
         self.mic_pos.map(|p_m| (r - p_m).norm())
+    }
+
+    /// Compute steering vector for position `pos` at frequency `f`
+    ///
+    /// - a_m = e^{-j*2*PI*f*tau_m}/r_m, with the delay as e^{-j*omega*tau};
+    /// - not normalized (includes the 1/r gain)
+    /// - `pos` in meters in the array frame, `f` in Hz
+    pub fn steering(&self, pos: &Vector3, f: f64) -> SVector<Complex64, M> {
+        let r = self.get_distance_from(pos);
+
+        Self::steering_from_distances(&r, f)
+    }
+
+    /// Compute steering vector for distances `r` at frequency `f`
+    ///
+    /// - a_m = e^{-j*2*PI*f*tau_m}/r_m, with the delay as e^{-j*omega*tau};
+    /// - not normalized (includes the 1/r gain)
+    /// - `r` in meters, one value per mic, in channel order
+    /// - frequency `f` in Hz
+    pub fn steering_from_distances(r: &[f64; M], f: f64) -> SVector<Complex64, M> {
+        SVector::from_fn(|m, _| {
+            let r_m = r[m];
+            let tau_m = distance_to_delay(r_m);
+            Complex64::from_polar(1.0 / r_m, -2.0 * PI * f * tau_m)
+        })
     }
 }
 

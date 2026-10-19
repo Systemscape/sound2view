@@ -2,6 +2,7 @@ pub mod camera;
 pub mod covariance;
 pub mod mic_array;
 pub mod reference;
+pub mod scan_grid;
 pub mod simulator;
 pub mod stft;
 
@@ -9,6 +10,7 @@ pub mod stft;
 pub(crate) mod test_util;
 
 pub type Vector3 = nalgebra::Vector3<f64>;
+pub type Point3 = nalgebra::Point3<f64>;
 pub type Complex64 = nalgebra::Complex<f64>;
 
 /// Speed of sound

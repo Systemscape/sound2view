@@ -1,19 +1,23 @@
 use std::{cmp, f64::consts::PI};
 
-use nalgebra::{SMatrix, SVector};
+use nalgebra::SMatrix;
 
 use crate::{
-    Complex64, distance_to_delay,
+    Complex64,
     mic_array::MicArray,
     simulator::{level_to_pressure, scene::Scene},
     stft::Stft,
 };
 
+/// Number of bins around the "real" one to catch leakage
+/// We inspect bin `k +/- BINS_AROUND`
+const BINS_AROUND: usize = 8;
+
 /// Calculate expected covariance matrix for a [Scene]
 ///
 /// - returns the expectation E(x * x^H) per FFT bin (vec[bin])
 /// - ignores the negative frequency image
-/// - considers only +/- 8 bins around each component
+/// - considers only +/- [`BINS_AROUND`] bins around each component
 /// - uses the scaling from the `stft`
 pub fn reference_covariance<const M: usize>(
     scene: &Scene,
@@ -39,20 +43,9 @@ pub fn reference_covariance<const M: usize>(
         let r = mic_array.get_distance_from(&source.pos);
 
         for component in source.signal.components() {
-            let mut a: SVector<Complex64, M> = SVector::zeros();
-
-            for m in 0..M {
-                let r_m = r[m];
-                let tau_m = distance_to_delay(r_m);
-                // Steering vector for that component's frequency
-                a[m] = Complex64::from_polar(1.0 / r_m, -2.0 * PI * component.freq_hz * tau_m);
-            }
+            let a = MicArray::steering_from_distances(&r, component.freq_hz);
 
             let a_ah = a * a.adjoint();
-
-            // Number of bins around the "real" one to catch leakage
-            // We inspect bin `k +/- BINS_AROUND`
-            const BINS_AROUND: usize = 8;
 
             let bin = (component.freq_hz * fft_len as f64 / f_s).round() as usize;
             let bin_lower_range = bin.saturating_sub(BINS_AROUND);

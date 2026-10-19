@@ -1,6 +1,6 @@
 use std::{env, error::Error, fs};
 
-use audio2video_rs::{
+use sound2view::{
     FrameSource,
     mic_array::MicArray,
     simulator::{Simulator, scene::Scene},
