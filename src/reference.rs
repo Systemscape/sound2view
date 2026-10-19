@@ -82,47 +82,14 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
-        Complex64, FrameSource, Vector3,
+        Complex64,
         covariance::Covariance,
         mic_array::MicArray,
         reference::reference_covariance,
-        simulator::{
-            Simulator,
-            scene::{MicNoiseParams, Scene, Source},
-            signal::{Signal, Sine},
-        },
+        simulator::{Simulator, scene::Scene},
         stft::{Stft, StftStream},
+        test_util::*,
     };
-
-    const SAMPLE_RATE: f64 = 48_000.0;
-    const DURATION_S: f64 = 0.5;
-    const FFT_LEN: usize = 1000;
-    const BIN: usize = 50;
-    const F_SINE: f64 = BIN as f64 * SAMPLE_RATE / FFT_LEN as f64;
-
-    fn test_pos() -> Vector3 {
-        Vector3::new(0.1, 0.2, 1.0)
-    }
-
-    fn test_sine() -> Sine {
-        Sine::new(1.0, F_SINE, 0.0)
-    }
-
-    /// One sine at `test_pos()`, mic noise at the given level.
-    fn test_scene(mic_noise_db: f64) -> Scene {
-        Scene {
-            sample_rate: SAMPLE_RATE,
-            duration_s: DURATION_S,
-            mic_noise_params: MicNoiseParams {
-                seed: 1,
-                level_db: mic_noise_db,
-            },
-            sources: vec![Source {
-                pos: test_pos(),
-                signal: Signal::Sine(test_sine()),
-            }],
-        }
-    }
 
     /// Simulator -> StftStream -> Covariance over the whole scene; returns (R_est, L).
     fn stream_covariance(
@@ -133,23 +100,15 @@ mod test {
         let mut stream = StftStream::<16>::new(Stft::new(FFT_LEN));
         let mut cov = Covariance::<16>::new(FFT_LEN / 2 + 1);
 
-        let mut buf = vec![0.0; 4096 * 16];
-        loop {
-            let n_frames = sim.read(&mut buf).unwrap();
-            if n_frames == 0 {
-                break;
-            }
-            stream.push(&buf[..n_frames * 16], |snapshots, _l| {
-                cov.accumulate(snapshots)
-            });
-        }
+        let samples = read_all(&mut sim, 4096);
+        stream.push(&samples, |snapshots, _l| cov.accumulate(snapshots));
 
         (cov.estimate(), cov.count())
     }
 
     #[test]
     fn one_sine_no_noise() {
-        let scene = test_scene(-1000.0);
+        let scene = test_scene(-1000.0, 0.5);
         let mic_array = MicArray::uma16();
 
         let r_ref = reference_covariance(&scene, &mic_array, &Stft::new(FFT_LEN));
@@ -178,9 +137,10 @@ mod test {
 
     #[test]
     fn one_sine_with_mic_noise() {
-        let scene = test_scene(110.0);
-        let mut scene_long = test_scene(110.0);
-        scene_long.duration_s = DURATION_S * 4.0;
+        const DURATION_S: f64 = 0.5;
+
+        let scene = test_scene(110.0, DURATION_S);
+        let scene_long = test_scene(110.0, DURATION_S * 4.0);
 
         let mic_array = MicArray::uma16();
 

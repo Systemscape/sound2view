@@ -109,56 +109,11 @@ mod tests {
     use std::f64::consts::PI;
 
     use crate::{
-        FrameSource, Vector3, distance_to_delay,
-        mic_array::MicArray,
-        simulator::{
-            Simulator,
-            scene::{MicNoiseParams, Scene, Source},
-            signal::{Signal, Sine},
-        },
+        FrameSource, distance_to_delay, mic_array::MicArray, simulator::Simulator, test_util::*,
     };
 
-    const SAMPLE_RATE: f64 = 48_000.0;
     const DURATION_S: f64 = 1.0;
-    const N_FRAMES: usize = 48_000;
-
-    fn test_pos() -> Vector3 {
-        Vector3::new(0.1, 0.2, 1.0)
-    }
-
-    fn test_sine() -> Sine {
-        Sine::new(1.0, 2400.0, 0.0)
-    }
-
-    /// One sine at `test_pos()`, mic noise at the given level.
-    fn test_scene(mic_noise_db: f64) -> Scene {
-        Scene {
-            sample_rate: SAMPLE_RATE,
-            duration_s: DURATION_S,
-            mic_noise_params: MicNoiseParams {
-                seed: 1,
-                level_db: mic_noise_db,
-            },
-            sources: vec![Source {
-                pos: test_pos(),
-                signal: Signal::Sine(test_sine()),
-            }],
-        }
-    }
-
-    /// Read until `Ok(0)` in chunks of `chunk_frames`; returns all samples.
-    fn read_all<const M: usize>(sim: &mut Simulator<M>, chunk_frames: usize) -> Vec<f64> {
-        let mut samples = Vec::new();
-        let mut buf = vec![0.0; chunk_frames * M];
-        loop {
-            let frames = sim.read(&mut buf).unwrap();
-            if frames == 0 {
-                break;
-            }
-            samples.extend_from_slice(&buf[..frames * M]);
-        }
-        samples
-    }
+    const N_FRAMES: usize = (SAMPLE_RATE * DURATION_S) as usize;
 
     #[test]
     fn single_source_propagation() {
@@ -166,7 +121,7 @@ mod tests {
         let sine = test_sine();
         let mic_array = MicArray::uma16();
 
-        let mut sim = Simulator::new(test_scene(-1000.0), mic_array.clone());
+        let mut sim = Simulator::new(test_scene(-1000.0, DURATION_S), mic_array.clone());
         let buf = read_all(&mut sim, 1024);
 
         assert_eq!(
@@ -195,7 +150,7 @@ mod tests {
 
     #[test]
     fn chunked_read_matches_single_read() {
-        let scene = test_scene(54.0);
+        let scene = test_scene(54.0, DURATION_S);
 
         // 7 does not divide N_FRAMES, so the last read is partial.
         let chunked = read_all(&mut Simulator::new(scene.clone(), MicArray::uma16()), 7);

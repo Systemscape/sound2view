@@ -5,6 +5,9 @@ pub mod reference;
 pub mod simulator;
 pub mod stft;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 pub type Vector3 = nalgebra::Vector3<f64>;
 pub type Complex64 = nalgebra::Complex<f64>;
 

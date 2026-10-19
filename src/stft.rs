@@ -135,14 +135,11 @@ mod test {
     use nalgebra::SVector;
 
     use crate::{
-        Complex64, FrameSource, Vector3, distance_to_delay,
+        Complex64, distance_to_delay,
         mic_array::MicArray,
-        simulator::{
-            Simulator,
-            scene::{MicNoiseParams, Scene, Source},
-            signal::{Signal, Sine},
-        },
+        simulator::Simulator,
         stft::{Stft, StftStream},
+        test_util::*,
     };
 
     const STREAM_FFT_LEN: usize = 64;
@@ -267,54 +264,30 @@ mod test {
     /// e^{-j * omega * tau}, the channel order and the 1/r gain.
     #[test]
     fn phase() {
-        let sample_rate = 48_000.0;
-        let duration_s = 0.1;
-        // Asymmetric, so all 16 distances differ
-        let position = Vector3::new(0.1, 0.2, 0.3);
-        let fft_len = 1024;
-
-        const BIN: usize = 50;
-
-        // Bin center: a delayed tone stays a pure bin-center tone, so the ratio is exact
-        let sine_freq = BIN as f64 * sample_rate / fft_len as f64;
-
-        let scene = Scene {
-            sample_rate,
-            duration_s,
-            mic_noise_params: MicNoiseParams {
-                seed: 1,
-                level_db: -1000.0,
-            },
-            sources: vec![Source {
-                pos: position,
-                signal: Signal::Sine(Sine::new(1.0, sine_freq, 0.0)),
-            }],
-        };
-
+        // Asymmetric position, so all 16 distances differ. F_SINE is a bin center:
+        // a delayed tone stays a pure bin-center tone, so the ratio is exact.
         let mic_array = MicArray::uma16();
-        let mut sim = Simulator::new(scene, mic_array.clone());
+        let mut sim = Simulator::new(test_scene(-1000.0, 0.1), mic_array.clone());
+        let samples = read_all(&mut sim, 4096);
 
-        let mut buf = vec![0f64; (16.0 * sample_rate * duration_s) as usize];
-
-        let n_frames = sim.read(&mut buf).unwrap();
         // Bin BIN of the last STFT frame; the sine is in steady state from t = 0
         let mut x: Option<SVector<Complex64, 16>> = None;
 
-        StftStream::new(Stft::new(fft_len)).push(&buf[..n_frames * 16], |snapshots, _l| {
+        StftStream::new(Stft::new(FFT_LEN)).push(&samples, |snapshots, _l| {
             x = Some(snapshots[BIN])
         });
 
         let x = x.expect("at least one STFT frame");
 
         // r_m and tau_m for every mic
-        let r = mic_array.get_distance_from(&position);
+        let r = mic_array.get_distance_from(&test_pos());
         let tau = r.map(distance_to_delay);
 
         for m in 0..16 {
             // x_m / x_0, written so the unknown source spectrum cancels
             let z = x[m] * x[0].conj() / x[0].norm_sqr();
             let expected =
-                Complex64::from_polar(r[0] / r[m], -2.0 * PI * sine_freq * (tau[m] - tau[0]));
+                Complex64::from_polar(r[0] / r[m], -2.0 * PI * F_SINE * (tau[m] - tau[0]));
 
             // Distance in the complex plane: checks magnitude and phase, immune to wrapping
             assert!(
