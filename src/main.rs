@@ -6,7 +6,7 @@ use image::{
 };
 use sound2view::{
     FrameSource, Point3,
-    beamformer::Das,
+    beamformer::{Das, Normalization},
     camera::{Camera, Intrinsics, Mount},
     covariance::Covariance,
     mic_array::MicArray,
@@ -73,7 +73,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pipeline = Pipeline {
         stream: StftStream::new(Stft::new(FFT_LEN)),
         cov: Covariance::new(FFT_LEN / 2 + 1),
-        das: Das::new(&scan_grid, &mic_array, scene.sample_rate, FFT_LEN, true),
+        das: Das::new(
+            &scan_grid,
+            &mic_array,
+            scene.sample_rate,
+            FFT_LEN,
+            true,
+            Normalization::TrueLocation,
+        ),
         bins,
         grid_width: scan_grid.width(),
         grid_height: scan_grid.height(),

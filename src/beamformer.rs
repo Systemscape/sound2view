@@ -6,6 +6,15 @@ use crate::{Complex64, mic_array::MicArray, scan_grid::ScanGrid};
 
 pub trait Beamformer {}
 
+/// Normalization c in P = c * a^H R a (Sarradj 2012, steering formulations III and IV)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Normalization {
+    /// c = 1/(a^H a)^2: P = S at the source, but the peak drifts toward farther points
+    TrueLevel,
+    /// c = 1/(M a^H a): peak exactly at the source, P = S * (a^H a)/M there
+    TrueLocation,
+}
+
 pub struct Das<const M: usize> {
     /// Precomputed distances per grid point
     distances: Vec<[f64; M]>,
@@ -26,12 +35,14 @@ impl<const M: usize> Das<M> {
     /// - `f_s`: sample rate in Hz
     /// - `fft_len`: FFT length N
     /// - `remove_diag`: turn on diagonal removal
+    /// - `normalization`: see [`Normalization`]
     pub fn new(
         scan_grid: &ScanGrid,
         mic_array: &MicArray<M>,
         f_s: f64,
         fft_len: usize,
         remove_diag: bool,
+        normalization: Normalization,
     ) -> Self {
         // Distances from each mic to each grid point
         let distances = Vec::from_iter(
@@ -41,15 +52,20 @@ impl<const M: usize> Das<M> {
                 .map(|pos| mic_array.get_distance_from(pos)),
         );
 
-        // Normalization factor without diagonal removal: `1/(sum(1 / r_m^2))^2`
-        // With diagonal removal: `1/(sum(g_m)^2 - sum(g_m^2))` with `g_m = |a_m|^2 = 1/r_m^2`
+        // With g_m = |a_m|^2 = 1/r_m^2 and sum(g_m) = a^H a:
+        // - TrueLevel: `1/sum(g_m)^2`, with diagonal removal `1/(sum(g_m)^2 - sum(g_m^2))`
+        // - TrueLocation: `1/(M sum(g_m))`, with diagonal removal `1/((M - 1) sum(g_m))`
         let normalization = Vec::from_iter(distances.iter().map(|r| {
             let g = r.map(|r_m| r_m.powi(-2));
             let sum_g: f64 = g.iter().sum();
-            let mut denom = sum_g.powi(2);
-            if remove_diag {
-                denom -= g.iter().map(|g_m| g_m * g_m).sum::<f64>();
-            }
+            let denom = match (normalization, remove_diag) {
+                (Normalization::TrueLevel, false) => sum_g.powi(2),
+                (Normalization::TrueLevel, true) => {
+                    sum_g.powi(2) - g.iter().map(|g_m| g_m * g_m).sum::<f64>()
+                }
+                (Normalization::TrueLocation, false) => M as f64 * sum_g,
+                (Normalization::TrueLocation, true) => (M - 1) as f64 * sum_g,
+            };
             1.0 / denom
         }));
 
@@ -70,7 +86,7 @@ impl<const M: usize> Das<M> {
     ///
     /// P = Σ_k aᴴR_k a * c, with optional diagonal removal
     ///
-    /// c = 1/(aᴴa)², or 1/((aᴴa)² − Σ|a_m|⁴) with diagonal removal
+    /// c is precomputed per grid point from [`Normalization`] and diagonal removal
     ///
     /// - `cov`: Covariance matrices for the whole spectrum (N/2 + 1 bins)
     /// - `bins`: absolute bin indices
@@ -129,7 +145,7 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
-        beamformer::Das,
+        beamformer::{Das, Normalization},
         mic_array::MicArray,
         reference::reference_covariance,
         stft::Stft,
@@ -149,7 +165,7 @@ mod test {
 
         let scan_grid = test_scan_grid();
         let mic_array = MicArray::uma16();
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
 
         // 1. Camera + ScanGrid, pick p_0 = grid.points()[grid.index(row, col)]
         let p_0 = scan_grid.points()[scan_grid.index(row, col)];
@@ -205,7 +221,7 @@ mod test {
         let cov_ref = reference_covariance(&scene, &mic_array, &stft);
 
         // 3. power_map over BIN..=BIN
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
         let mut power = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power);
 
@@ -245,7 +261,7 @@ mod test {
         let (cov_est, l) = stream_covariance(&scene, &mic_array);
         assert!(l > 0, "no STFT frames");
 
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
         let mut power_ref = vec![0.0; scan_grid.points().len()];
         let mut power_est = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power_ref);
