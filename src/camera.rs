@@ -143,16 +143,9 @@ mod test {
 
     use crate::{
         Point3, Vector3,
-        camera::{Camera, Intrinsics, Mount},
+        camera::{Camera, Mount},
+        test_util::test_camera,
     };
-
-    /// 1920x1080, 100 deg HFOV, mounted at the array center.
-    fn test_camera() -> Camera {
-        Camera {
-            intrinsics: Intrinsics::from_hfov(1920, 1080, 100f64.to_radians()),
-            mount: Mount::default(),
-        }
-    }
 
     #[test]
     fn roundtrip_project_unproject() {

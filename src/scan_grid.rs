@@ -54,18 +54,7 @@ impl ScanGrid {
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        camera::{Camera, Intrinsics, Mount},
-        scan_grid::ScanGrid,
-    };
-
-    /// 1920x1080, 100 deg HFOV, mounted at the array center.
-    fn test_camera() -> Camera {
-        Camera {
-            intrinsics: Intrinsics::from_hfov(1920, 1080, 100f64.to_radians()),
-            mount: Mount::default(),
-        }
-    }
+    use crate::{scan_grid::ScanGrid, test_util::test_camera};
 
     #[test]
     fn points_len_w_times_h() {

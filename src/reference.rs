@@ -75,29 +75,9 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
-        Complex64,
-        covariance::Covariance,
-        mic_array::MicArray,
-        reference::reference_covariance,
-        simulator::{Simulator, scene::Scene},
-        stft::{Stft, StftStream},
+        Complex64, mic_array::MicArray, reference::reference_covariance, stft::Stft,
         test_util::*,
     };
-
-    /// Simulator -> StftStream -> Covariance over the whole scene; returns (R_est, L).
-    fn stream_covariance(
-        scene: &Scene,
-        mic_array: &MicArray<16>,
-    ) -> (Vec<SMatrix<Complex64, 16, 16>>, usize) {
-        let mut sim = Simulator::new(scene.clone(), mic_array.clone());
-        let mut stream = StftStream::<16>::new(Stft::new(FFT_LEN));
-        let mut cov = Covariance::<16>::new(FFT_LEN / 2 + 1);
-
-        let samples = read_all(&mut sim, 4096);
-        stream.push(&samples, |snapshots, _l| cov.accumulate(snapshots));
-
-        (cov.estimate(), cov.count())
-    }
 
     #[test]
     fn one_sine_no_noise() {

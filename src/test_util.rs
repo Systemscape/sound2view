@@ -1,10 +1,17 @@
+use nalgebra::SMatrix;
+
 use crate::{
-    FrameSource as _, Vector3,
+    Complex64, FrameSource as _, Vector3,
+    camera::{Camera, Intrinsics, Mount},
+    covariance::Covariance,
+    mic_array::MicArray,
+    scan_grid::ScanGrid,
     simulator::{
         Simulator,
         scene::{MicNoiseParams, Scene, Source},
         signal::{Signal, Sine},
     },
+    stft::{Stft, StftStream},
 };
 
 pub const SAMPLE_RATE: f64 = 48_000.0;
@@ -50,4 +57,37 @@ pub fn read_all<const M: usize>(sim: &mut Simulator<M>, chunk_frames: usize) -> 
         samples.extend_from_slice(&buf[..frames * M]);
     }
     samples
+}
+
+/// Simulator -> StftStream -> Covariance over the whole scene; returns (R_est, L).
+pub fn stream_covariance<const M: usize>(
+    scene: &Scene,
+    mic_array: &MicArray<M>,
+) -> (Vec<SMatrix<Complex64, M, M>>, usize) {
+    let mut sim = Simulator::new(scene.clone(), mic_array.clone());
+    let mut stream = StftStream::<M>::new(Stft::new(FFT_LEN));
+    let mut cov = Covariance::<M>::new(FFT_LEN / 2 + 1);
+
+    let samples = read_all(&mut sim, 4096);
+    stream.push(&samples, |snapshots, _l| cov.accumulate(snapshots));
+
+    (cov.estimate(), cov.count())
+}
+
+/// Camera that matches approx. the UMA16
+pub fn test_camera() -> Camera {
+    Camera {
+        intrinsics: Intrinsics::from_hfov(1920, 1080, 110f64.to_radians()),
+        mount: Mount::default(),
+    }
+}
+
+/// Create a ScanGrid from [`test_camera()`] with width 192 and 1m focus distance
+pub fn test_scan_grid() -> ScanGrid {
+    ScanGrid::new(&test_camera(), 192, 1.0)
+}
+
+/// Bin power of a bin-centered sine after Hann + Stft scaling: (A^2/2)*N/3
+pub fn sine_bin_power(amplitude: f64, fft_len: usize) -> f64 {
+    amplitude.powi(2) / 2.0 * fft_len as f64 / 3.0
 }

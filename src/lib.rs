@@ -1,3 +1,4 @@
+pub mod beamformer;
 pub mod camera;
 pub mod covariance;
 pub mod mic_array;
@@ -40,5 +41,3 @@ pub struct VideoFrame {
     /// RGBA8, row-major, origin top-left; len = width * height * 4.
     pub pixels: Vec<u8>,
 }
-
-pub trait Beamformer {}
