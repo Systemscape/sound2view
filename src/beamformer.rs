@@ -29,7 +29,7 @@ impl<const M: usize> Das<M> {
             scan_grid
                 .points()
                 .iter()
-                .map(|pos| mic_array.get_distance_from(&pos.coords)),
+                .map(|pos| mic_array.get_distance_from(&pos)),
         );
 
         // Normalization factor is `1/(sum(1 / r_m^2))^2`
@@ -101,8 +101,8 @@ mod test {
         reference::reference_covariance,
         stft::Stft,
         test_util::{
-            BIN, F_SINE, FFT_LEN, SAMPLE_RATE, sine_bin_power, stream_covariance,
-            test_scan_grid, test_scene,
+            BIN, F_SINE, FFT_LEN, SAMPLE_RATE, sine_bin_power, stream_covariance, test_scan_grid,
+            test_scene,
         },
     };
 
@@ -122,7 +122,7 @@ mod test {
         let p_0 = scan_grid.points()[scan_grid.index(row, col)];
 
         // 2. a_0 = steering at p_0 for bin BIN, R_k = a_0 a_0^H in bin BIN, zeros elsewhere
-        let a_0 = mic_array.steering(&p_0.coords, F_SINE);
+        let a_0 = mic_array.steering(&p_0, F_SINE);
         let mut cov = vec![SMatrix::zeros(); FFT_LEN / 2 + 1];
         cov[BIN] = a_0 * a_0.adjoint();
 
@@ -141,7 +141,7 @@ mod test {
 
         for (power, r) in power.iter().zip(scan_grid.points()) {
             let a_i_norm_squared: f64 = mic_array
-                .get_distance_from(&r.coords)
+                .get_distance_from(&r)
                 .iter()
                 .map(|r| r.powi(-2))
                 .sum();
@@ -164,7 +164,7 @@ mod test {
         let scan_grid = test_scan_grid();
         let mut scene = test_scene(-1000.0, DURATION_S);
         let idx_source = scan_grid.index(scan_grid.height() / 2, scan_grid.width() / 2);
-        scene.sources[0].pos = scan_grid.points()[idx_source].coords;
+        scene.sources[0].pos = scan_grid.points()[idx_source];
         let mic_array = MicArray::uma16();
         let stft = Stft::new(FFT_LEN);
 
@@ -205,7 +205,7 @@ mod test {
         let scan_grid = test_scan_grid();
         let mut scene = test_scene(90.0, DURATION_S);
         let idx_source = scan_grid.index(scan_grid.height() / 2, scan_grid.width() / 2);
-        scene.sources[0].pos = scan_grid.points()[idx_source].coords;
+        scene.sources[0].pos = scan_grid.points()[idx_source];
         let mic_array = MicArray::uma16();
 
         let cov_ref = reference_covariance(&scene, &mic_array, &Stft::new(FFT_LEN));

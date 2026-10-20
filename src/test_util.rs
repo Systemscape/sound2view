@@ -1,7 +1,7 @@
 use nalgebra::SMatrix;
 
 use crate::{
-    Complex64, FrameSource as _, Vector3,
+    Complex64, FrameSource as _, Point3,
     camera::{Camera, Intrinsics, Mount},
     covariance::Covariance,
     mic_array::MicArray,
@@ -20,8 +20,8 @@ pub const BIN: usize = 50;
 
 pub const F_SINE: f64 = BIN as f64 * SAMPLE_RATE / FFT_LEN as f64;
 
-pub fn test_pos() -> Vector3 {
-    Vector3::new(0.1, 0.2, 1.0)
+pub fn test_pos() -> Point3 {
+    Point3::new(0.1, 0.2, 1.0)
 }
 
 /// Sine with amplitude 1, frequency `F_SINE` and zero-phase

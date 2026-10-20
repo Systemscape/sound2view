@@ -3,7 +3,7 @@ use rand_distr::Normal;
 use serde::Deserialize;
 
 use crate::{
-    Vector3,
+    Point3,
     simulator::{level_to_pressure, signal::Signal},
 };
 
@@ -44,7 +44,7 @@ impl Scene {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Source {
     /// Position in meters relative to center of array frame, z into the scene
-    pub pos: Vector3,
+    pub pos: Point3,
     /// Signal parameters
     pub signal: Signal,
 }
@@ -89,7 +89,7 @@ impl MicNoise {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Vector3,
+        Point3,
         simulator::{
             level_to_pressure,
             scene::{MicNoise, MicNoiseParams, Scene},
@@ -125,9 +125,9 @@ mod tests {
         assert_eq!(scene.mic_noise_params.level_db, 30.0);
 
         assert_eq!(scene.sources.len(), 2);
-        assert_eq!(scene.sources[0].pos, Vector3::new(1.0, -2.0, 3.0));
+        assert_eq!(scene.sources[0].pos, Point3::new(1.0, -2.0, 3.0));
         assert!(matches!(scene.sources[0].signal, Signal::Sine(_)));
-        assert_eq!(scene.sources[1].pos, Vector3::new(0.0, 0.0, 1.0));
+        assert_eq!(scene.sources[1].pos, Point3::new(0.0, 0.0, 1.0));
         assert!(matches!(scene.sources[1].signal, Signal::Noise(_)));
     }
 

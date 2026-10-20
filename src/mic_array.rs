@@ -2,13 +2,13 @@ use std::f64::consts::PI;
 
 use nalgebra::SVector;
 
-use crate::{Complex64, Vector3, distance_to_delay};
+use crate::{Complex64, Point3, distance_to_delay};
 
 /// A Microphone array with `M` elements.
 #[derive(Clone, Debug)]
 pub struct MicArray<const M: usize> {
     /// Microphone positions, indexed by channels from the audio stream
-    pub mic_pos: [Vector3; M],
+    pub mic_pos: [Point3; M],
 }
 
 impl<const M: usize> MicArray<M> {
@@ -36,7 +36,7 @@ impl<const M: usize> MicArray<M> {
             for col in 0..cols {
                 let ch = channel_of(row, col);
 
-                let p = Vector3::new(
+                let p = Point3::new(
                     // Row and col are zero-based indices.
                     // To map them to an x/y coordinate we have to
                     //
@@ -70,7 +70,7 @@ impl<const M: usize> MicArray<M> {
         }
     }
 
-    pub fn get_distance_from(&self, r: &Vector3) -> [f64; M] {
+    pub fn get_distance_from(&self, r: &Point3) -> [f64; M] {
         self.mic_pos.map(|p_m| (r - p_m).norm())
     }
 
@@ -79,7 +79,7 @@ impl<const M: usize> MicArray<M> {
     /// - a_m = e^{-j*2*PI*f*tau_m}/r_m, with the delay as e^{-j*omega*tau};
     /// - not normalized (includes the 1/r gain)
     /// - `pos` in meters in the array frame, `f` in Hz
-    pub fn steering(&self, pos: &Vector3, f: f64) -> SVector<Complex64, M> {
+    pub fn steering(&self, pos: &Point3, f: f64) -> SVector<Complex64, M> {
         let r = self.get_distance_from(pos);
 
         Self::steering_from_distances(&r, f)
@@ -124,11 +124,11 @@ mod test {
         eprintln!("{:#?}", uma16.mic_pos[0]);
         eprintln!("expected: {:#?}", expected_pos_ch0);
 
-        let norm_ch0 = (uma16.mic_pos[0] - expected_pos_ch0).norm();
-        let norm_ch15 = (uma16.mic_pos[15] - expected_pos_ch15).norm();
+        let norm_ch0 = (uma16.mic_pos[0] - expected_pos_ch0).coords.norm();
+        let norm_ch15 = (uma16.mic_pos[15] - expected_pos_ch15).coords.norm();
 
         // Sanity check: use a different mic and computeh against ch15's expected position
-        let norm_ch14_false = (uma16.mic_pos[14] - expected_pos_ch15).norm();
+        let norm_ch14_false = (uma16.mic_pos[14] - expected_pos_ch15).coords.norm();
 
         // Assert the norm is almost zero (ignored float imprecisions)
         assert!(norm_ch0 < f64::EPSILON);
@@ -151,11 +151,11 @@ mod test {
         // Rescale to be DISTANCE away
         let r_k = u_k * DISTANCE;
 
-        let r_mk = uma16.get_distance_from(&r_k);
+        let r_mk = uma16.get_distance_from(&r_k.into());
         let tau_mk = r_mk.map(distance_to_delay);
 
         let tau_mk_approx = p
-            .map(|p_m| p_m.dot(&u_k))
+            .map(|p_m| p_m.coords.dot(&u_k))
             .map(distance_to_delay)
             .map(|x| -1.0 * x + distance_to_delay(DISTANCE));
 
