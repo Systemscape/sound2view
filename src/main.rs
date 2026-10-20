@@ -8,6 +8,7 @@ use sound2view::{
     FrameSource, Point3,
     beamformer::{Das, Normalization},
     camera::{Camera, Intrinsics, Mount},
+    capture,
     covariance::Covariance,
     mic_array::MicArray,
     scan_grid::ScanGrid,
@@ -44,11 +45,15 @@ struct Pipeline<const M: usize> {
     src_pos: Vec<Point3>,
 }
 
-/// Usage: `sound2view [scene.toml]`, defaults to `config.toml`.
+/// Usage: `sound2view [scene.toml]`, defaults to `config.toml`; `sound2view probe` lists input devices.
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
+
+    if path == "probe" {
+        return capture::probe();
+    }
 
     println!("Reading scene from {path}");
     let scene = Scene::from_toml(&fs::read_to_string(&path)?)?;

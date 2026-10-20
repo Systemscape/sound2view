@@ -1,5 +1,6 @@
 pub mod beamformer;
 pub mod camera;
+pub mod capture;
 pub mod covariance;
 pub mod mic_array;
 pub mod reference;
