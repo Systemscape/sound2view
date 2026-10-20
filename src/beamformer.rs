@@ -61,6 +61,11 @@ impl<const M: usize> Das<M> {
         }
     }
 
+    /// Get the number of points in the scanning grid
+    pub fn n_points(&self) -> usize {
+        self.distances.len()
+    }
+
     /// Compute the power map
     ///
     /// P = Σ_k aᴴR_k a * c, with optional diagonal removal
