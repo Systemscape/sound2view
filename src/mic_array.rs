@@ -4,6 +4,15 @@ use nalgebra::SVector;
 
 use crate::{Complex64, Point3, distance_to_delay};
 
+/// UMA-16 v2 USB channel per mic, indexed `[row][col]`
+///
+/// - row 0 = top = +y, col 0 = left = -x, viewed from the source side (z into the scene)
+/// - From Acoular `minidsp_uma-16.xml` (>= 24.03, corrected in x): channel = point - 1
+/// - Not yet verified on hardware: check that a source left of the array (as seen by the
+///   camera) peaks on the left of the map; if mirrored, reverse the columns
+pub const UMA16_CHANNELS: [[usize; 4]; 4] =
+    [[8, 9, 6, 7], [10, 11, 4, 5], [12, 13, 2, 3], [14, 15, 0, 1]];
+
 /// A Microphone array with `M` elements.
 #[derive(Clone, Debug)]
 pub struct MicArray<const M: usize> {
@@ -103,7 +112,7 @@ impl<const M: usize> MicArray<M> {
 impl MicArray<16> {
     /// Helper to create the UMA-16 Mic array
     pub fn uma16() -> MicArray<16> {
-        MicArray::<16>::uniform_rect(4, 4, 0.042, 0.042, |row, column| row + 4 * column)
+        MicArray::<16>::uniform_rect(4, 4, 0.042, 0.042, |row, col| UMA16_CHANNELS[row][col])
     }
 }
 
@@ -111,29 +120,36 @@ impl MicArray<16> {
 mod test {
     use crate::{Point3, Vector3, distance_to_delay, mic_array::MicArray};
 
+    /// All 16 positions against Acoular `minidsp_uma-16.xml` (>= 24.03), channel = point - 1.
     #[test]
     fn test_uma16_geometry() {
         let uma16 = MicArray::uma16();
 
-        // The position should be -1.5 * 42mm in x and +1.5 * 42mm in y.
-        //
-        // TODO(julian): Once we know the real channel mapping, update this test
-        let expected_pos_ch0 = Point3::new(-1.5 * 0.042, 1.5 * 0.042, 0.0);
-        let expected_pos_ch15 = Point3::new(1.5 * 0.042, -1.5 * 0.042, 0.0);
+        // (x, y) in meters, copied from the Acoular file
+        let expected: [(f64, f64); 16] = [
+            (0.021, -0.063),
+            (0.063, -0.063),
+            (0.021, -0.021),
+            (0.063, -0.021),
+            (0.021, 0.021),
+            (0.063, 0.021),
+            (0.021, 0.063),
+            (0.063, 0.063),
+            (-0.063, 0.063),
+            (-0.021, 0.063),
+            (-0.063, 0.021),
+            (-0.021, 0.021),
+            (-0.063, -0.021),
+            (-0.021, -0.021),
+            (-0.063, -0.063),
+            (-0.021, -0.063),
+        ];
 
-        eprintln!("{:#?}", uma16.mic_pos[0]);
-        eprintln!("expected: {:#?}", expected_pos_ch0);
-
-        let norm_ch0 = (uma16.mic_pos[0] - expected_pos_ch0).norm();
-        let norm_ch15 = (uma16.mic_pos[15] - expected_pos_ch15).norm();
-
-        // Sanity check: use a different mic and computeh against ch15's expected position
-        let norm_ch14_false = (uma16.mic_pos[14] - expected_pos_ch15).norm();
-
-        // Assert the norm is almost zero (ignored float imprecisions)
-        assert!(norm_ch0 < f64::EPSILON);
-        assert!(norm_ch15 < f64::EPSILON);
-        assert!(norm_ch14_false > f64::EPSILON);
+        for (ch, (x, y)) in expected.into_iter().enumerate() {
+            let p = uma16.mic_pos[ch];
+            let err = (p - Point3::new(x, y, 0.0)).norm();
+            assert!(err < 1e-12, "channel {ch}: expected ({x}, {y}), got {p}");
+        }
     }
 
     #[test]
