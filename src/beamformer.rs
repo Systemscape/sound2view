@@ -9,10 +9,12 @@ pub trait Beamformer {}
 pub struct Das<const M: usize> {
     /// Precomputed distances per grid point
     distances: Vec<[f64; M]>,
-    /// Normalization 1/(a^H * a)^2 per grid point
+    /// Normalization factor per grid point
     normalization: Vec<f64>,
     /// FFT bin spacing in Hz
     df: f64,
+    /// Diagonal removal enabled
+    remove_diag: bool,
 }
 
 impl<const M: usize> Das<M> {
@@ -23,34 +25,49 @@ impl<const M: usize> Das<M> {
     /// - `mic_array`: microphone array configuration, only used for construction
     /// - `f_s`: sample rate in Hz
     /// - `fft_len`: FFT length N
-    pub fn new(scan_grid: &ScanGrid, mic_array: &MicArray<M>, f_s: f64, fft_len: usize) -> Self {
+    /// - `remove_diag`: turn on diagonal removal
+    pub fn new(
+        scan_grid: &ScanGrid,
+        mic_array: &MicArray<M>,
+        f_s: f64,
+        fft_len: usize,
+        remove_diag: bool,
+    ) -> Self {
         // Distances from each mic to each grid point
         let distances = Vec::from_iter(
             scan_grid
                 .points()
                 .iter()
-                .map(|pos| mic_array.get_distance_from(&pos)),
+                .map(|pos| mic_array.get_distance_from(pos)),
         );
 
-        // Normalization factor is `1/(sum(1 / r_m^2))^2`
-        let normalization = Vec::from_iter(
-            distances
-                .iter()
-                .map(|r| r.iter().map(|r_m| r_m.powi(-2)).sum::<f64>().powi(-2)),
-        );
+        // Normalization factor without diagonal removal: `1/(sum(1 / r_m^2))^2`
+        // With diagonal removal: `1/(sum(g_m)^2 - sum(g_m^2))` with `g_m = |a_m|^2 = 1/r_m^2`
+        let normalization = Vec::from_iter(distances.iter().map(|r| {
+            let g = r.map(|r_m| r_m.powi(-2));
+            let sum_g: f64 = g.iter().sum();
+            let mut denom = sum_g.powi(2);
+            if remove_diag {
+                denom -= g.iter().map(|g_m| g_m * g_m).sum::<f64>();
+            }
+            1.0 / denom
+        }));
 
         Self {
             distances,
             normalization,
             df: f_s / fft_len as f64,
+            remove_diag,
         }
     }
 
     /// Compute the power map
     ///
-    /// P = Σ_k aᴴR_k a / (aᴴa)², no diagonal removal
+    /// P = Σ_k aᴴR_k a * c, with optional diagonal removal
     ///
-    /// - `cov`: Covariance matrixes for the whole spectrum (N/2 + 1 bins)
+    /// c = 1/(aᴴa)², or 1/((aᴴa)² − Σ|a_m|⁴) with diagonal removal
+    ///
+    /// - `cov`: Covariance matrices for the whole spectrum (N/2 + 1 bins)
     /// - `bins`: absolute bin indices
     /// - Sums power over `bins` of the fft
     /// - `out`: row-major like the [`ScanGrid`], overwritten
@@ -85,7 +102,18 @@ impl<const M: usize> Das<M> {
                 .zip(out.iter_mut())
             {
                 let a = MicArray::steering_from_distances(r_p, f_k);
-                *out_p += a.dotc(&(cov_k * a)).re * normalization;
+
+                let mut p = a.dotc(&(cov_k * a)).re;
+
+                if self.remove_diag {
+                    let diag = r_p
+                        .iter()
+                        .enumerate()
+                        .map(|(m, r_m)| r_m.powi(-2) * cov_k[(m, m)].re)
+                        .sum::<f64>();
+                    p -= diag;
+                }
+                *out_p += p * normalization;
             }
         }
     }
@@ -116,7 +144,7 @@ mod test {
 
         let scan_grid = test_scan_grid();
         let mic_array = MicArray::uma16();
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
 
         // 1. Camera + ScanGrid, pick p_0 = grid.points()[grid.index(row, col)]
         let p_0 = scan_grid.points()[scan_grid.index(row, col)];
@@ -172,7 +200,7 @@ mod test {
         let cov_ref = reference_covariance(&scene, &mic_array, &stft);
 
         // 3. power_map over BIN..=BIN
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
         let mut power = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power);
 
@@ -212,7 +240,7 @@ mod test {
         let (cov_est, l) = stream_covariance(&scene, &mic_array);
         assert!(l > 0, "no STFT frames");
 
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false);
         let mut power_ref = vec![0.0; scan_grid.points().len()];
         let mut power_est = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power_ref);
@@ -236,5 +264,39 @@ mod test {
             (p_est - p_ref).abs() < 0.02 * p_ref,
             "P at source: expected {p_ref}, got {p_est}"
         );
+    }
+
+    /// Hand-built R = a_0 a_0^H on grid point p_0, diagonal removal on.
+    /// Expect P(p_0) = 1: checks the new normalization and the diagonal term together.
+    #[test]
+    fn diag_removal_hand_built_r_at_source() {
+        // 1. Same setup as `hand_built_r_peak_at_source`, but `Das::new(..., true)`
+        // 2. power_map over BIN..=BIN
+        // 3. assert P(p_0) = 1
+        todo!()
+    }
+
+    /// R = sigma^2 I in one bin, nothing else.
+    /// Expect P = 0 everywhere with diagonal removal, sigma^2 / (a^H a) without.
+    #[test]
+    fn diag_removal_noise_only_is_zero() {
+        // 1. cov[BIN] = sigma^2 * I, zeros elsewhere
+        // 2. power_map with `true`: assert |P| < tol everywhere (tol relative to sigma^2)
+        // 3. power_map with `false`: assert P = sigma^2 / sum(1/r_m^2) per point
+        todo!()
+    }
+
+    /// Oracle R vs stream R_est with strong mic noise, diagonal removal on.
+    /// Expect the peak at the source for both, and P_est close to P_ref = S.
+    #[test]
+    fn diag_removal_stream_r_peak_at_source() {
+        // 1. Source on the center grid point, 110 dB mic noise
+        // 2. cov_ref = reference_covariance(...), (cov_est, l) = stream_covariance(...)
+        // 3. power_map for both with `true`
+        // 4. assert P_ref(source) = sine_bin_power (sigma^2 I is gone)
+        // 5. assert argmax of P_est == source index
+        // 6. assert P_est(source) close to P_ref(source)
+        // 7. optional: compare with `false`, |P_est - P_ref| should be smaller with removal
+        todo!()
     }
 }

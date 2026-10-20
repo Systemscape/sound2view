@@ -109,7 +109,7 @@ impl MicArray<16> {
 
 #[cfg(test)]
 mod test {
-    use crate::{Vector3, distance_to_delay, mic_array::MicArray};
+    use crate::{Point3, Vector3, distance_to_delay, mic_array::MicArray};
 
     #[test]
     fn test_uma16_geometry() {
@@ -118,17 +118,17 @@ mod test {
         // The position should be -1.5 * 42mm in x and +1.5 * 42mm in y.
         //
         // TODO(julian): Once we know the real channel mapping, update this test
-        let expected_pos_ch0 = Vector3::new(-1.5 * 0.042, 1.5 * 0.042, 0.0);
-        let expected_pos_ch15 = Vector3::new(1.5 * 0.042, -1.5 * 0.042, 0.0);
+        let expected_pos_ch0 = Point3::new(-1.5 * 0.042, 1.5 * 0.042, 0.0);
+        let expected_pos_ch15 = Point3::new(1.5 * 0.042, -1.5 * 0.042, 0.0);
 
         eprintln!("{:#?}", uma16.mic_pos[0]);
         eprintln!("expected: {:#?}", expected_pos_ch0);
 
-        let norm_ch0 = (uma16.mic_pos[0] - expected_pos_ch0).coords.norm();
-        let norm_ch15 = (uma16.mic_pos[15] - expected_pos_ch15).coords.norm();
+        let norm_ch0 = (uma16.mic_pos[0] - expected_pos_ch0).norm();
+        let norm_ch15 = (uma16.mic_pos[15] - expected_pos_ch15).norm();
 
         // Sanity check: use a different mic and computeh against ch15's expected position
-        let norm_ch14_false = (uma16.mic_pos[14] - expected_pos_ch15).coords.norm();
+        let norm_ch14_false = (uma16.mic_pos[14] - expected_pos_ch15).norm();
 
         // Assert the norm is almost zero (ignored float imprecisions)
         assert!(norm_ch0 < f64::EPSILON);
@@ -149,9 +149,9 @@ mod test {
         // Unit vector in direction
         let u_k = direction / direction.norm();
         // Rescale to be DISTANCE away
-        let r_k = u_k * DISTANCE;
+        let r_k = Point3::from(u_k * DISTANCE);
 
-        let r_mk = uma16.get_distance_from(&r_k.into());
+        let r_mk = uma16.get_distance_from(&r_k);
         let tau_mk = r_mk.map(distance_to_delay);
 
         let tau_mk_approx = p
