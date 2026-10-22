@@ -1,4 +1,4 @@
-use std::{env, error::Error, fs, ops::RangeInclusive};
+use std::{env, error::Error, fs, ops::RangeInclusive, time::Instant};
 
 use image::{
     Rgb, RgbImage,
@@ -8,7 +8,7 @@ use sound2view::{
     FrameSource, Point3,
     beamformer::{Das, Normalization},
     camera::{Camera, Intrinsics, Mount},
-    capture,
+    capture::{self, CpalSource},
     covariance::Covariance,
     mic_array::MicArray,
     scan_grid::ScanGrid,
@@ -45,62 +45,95 @@ struct Pipeline<const M: usize> {
     src_pos: Vec<Point3>,
 }
 
-/// Usage: `sound2view [scene.toml]`, defaults to `config.toml`; `sound2view probe` lists input devices.
+impl Pipeline<16> {
+    /// UMA-16 pipeline for `sample_rate` in Hz; `src_pos` are the true sources for the markers.
+    fn new(sample_rate: f64, src_pos: Vec<Point3>) -> Self {
+        let camera = Camera {
+            intrinsics: Intrinsics::from_hfov(1920, 1080, HFOV_DEG.to_radians()),
+            mount: Mount::default(),
+        };
+        let scan_grid = ScanGrid::new(&camera, GRID_WIDTH, GRID_Z);
+
+        let df = sample_rate / FFT_LEN as f64;
+        let bins = (F_LO_HZ / df).round() as usize..=(F_HI_HZ / df).round() as usize;
+
+        println!(
+            "Grid {}x{}, bins {bins:?}, L = {L_FRAMES}",
+            scan_grid.width(),
+            scan_grid.height()
+        );
+
+        Self {
+            stream: StftStream::new(Stft::new(FFT_LEN)),
+            cov: Covariance::new(FFT_LEN / 2 + 1),
+            das: Das::new(
+                &scan_grid,
+                &MicArray::uma16(),
+                sample_rate,
+                FFT_LEN,
+                true,
+                Normalization::TrueLocation,
+            ),
+            bins,
+            grid_width: scan_grid.width(),
+            grid_height: scan_grid.height(),
+            camera,
+            src_pos,
+        }
+    }
+}
+
+/// Input device id pattern of the UMA-16, see `sound2view probe`
+const MIC_DEVICE: &str = "hw:CARD=UMA16v2";
+const MIC_SAMPLE_RATE: u32 = 48_000;
+/// Number of maps written in mic mode
+const MIC_MAPS: usize = 20;
+
+/// Usage:
+/// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
+/// - `sound2view mic`: capture from the UMA-16
+/// - `sound2view probe`: list input devices
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = env::args()
+    let arg = env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
 
-    if path == "probe" {
-        return capture::probe();
+    match arg.as_str() {
+        "probe" => capture::probe(),
+        "mic" => run_mic(),
+        path => run_sim(path),
     }
-
-    println!("Reading scene from {path}");
-    let scene = Scene::from_toml(&fs::read_to_string(&path)?)?;
-    scene.validate();
-
-    let mic_array = MicArray::uma16();
-    let camera = Camera {
-        intrinsics: Intrinsics::from_hfov(1920, 1080, HFOV_DEG.to_radians()),
-        mount: Mount::default(),
-    };
-    let scan_grid = ScanGrid::new(&camera, GRID_WIDTH, GRID_Z);
-
-    let df = scene.sample_rate / FFT_LEN as f64;
-    let bins = (F_LO_HZ / df).round() as usize..=(F_HI_HZ / df).round() as usize;
-
-    println!(
-        "Running simulator: grid {}x{}, bins {bins:?}, L = {L_FRAMES}",
-        scan_grid.width(),
-        scan_grid.height()
-    );
-
-    let pipeline = Pipeline {
-        stream: StftStream::new(Stft::new(FFT_LEN)),
-        cov: Covariance::new(FFT_LEN / 2 + 1),
-        das: Das::new(
-            &scan_grid,
-            &mic_array,
-            scene.sample_rate,
-            FFT_LEN,
-            true,
-            Normalization::TrueLocation,
-        ),
-        bins,
-        grid_width: scan_grid.width(),
-        grid_height: scan_grid.height(),
-        camera,
-        src_pos: scene.sources.iter().map(|s| s.pos).collect(),
-    };
-
-    let sim = Simulator::new(scene, mic_array);
-    run(sim, pipeline)
 }
 
-/// Read the stream until the end; one power map per `L_FRAMES` STFT frames.
+fn run_sim(path: &str) -> Result<(), Box<dyn Error>> {
+    println!("Reading scene from {path}");
+    let scene = Scene::from_toml(&fs::read_to_string(path)?)?;
+    scene.validate();
+
+    let pipeline = Pipeline::new(
+        scene.sample_rate,
+        scene.sources.iter().map(|s| s.pos).collect(),
+    );
+    let mut sim = Simulator::new(scene, MicArray::uma16());
+    run(&mut sim, pipeline, None)
+}
+
+fn run_mic() -> Result<(), Box<dyn Error>> {
+    println!("Capturing from {MIC_DEVICE} at {MIC_SAMPLE_RATE} Hz");
+    let mut mic = CpalSource::<16>::new(MIC_DEVICE, MIC_SAMPLE_RATE)?;
+
+    let pipeline = Pipeline::new(MIC_SAMPLE_RATE as f64, Vec::new());
+    run(&mut mic, pipeline, Some(MIC_MAPS))?;
+
+    println!("dropped {} chunks", mic.dropped());
+    Ok(())
+}
+
+/// Read the stream until the end or until `max_maps` maps are written; one power map per `L_FRAMES` STFT frames.
 fn run<S: FrameSource<M>, const M: usize>(
-    mut source: S,
+    source: &mut S,
     mut pipeline: Pipeline<M>,
+    max_maps: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
     let mut buf = vec![0.0; 1024 * M];
     let mut total_frames = 0;
@@ -121,14 +154,20 @@ fn run<S: FrameSource<M>, const M: usize>(
 
         if pipeline.cov.count() >= L_FRAMES {
             let cov_est = pipeline.cov.estimate();
+            let start = Instant::now();
             pipeline
                 .das
                 .power_map(&cov_est, pipeline.bins.clone(), &mut out);
+            println!("map {map_index}: power_map {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
 
             write_map(&out, &pipeline, &format!("map_{map_index:03}.png"))?;
             map_index += 1;
 
             pipeline.cov.reset();
+
+            if max_maps.is_some_and(|max| map_index >= max) {
+                break;
+            }
         }
     }
 

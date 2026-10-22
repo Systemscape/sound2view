@@ -19,7 +19,7 @@ use crate::FrameSource;
 
 /// Chunks buffered between the audio callback and `read` before chunks get dropped
 const CHANNEL_CAPACITY: usize = 64;
-/// Full scale of the I32 samples (24 bit left-justified in 32 bit)
+/// Full scale of the I32 samples (24 bit left-justified in 32 bit, i.e. 2^31)
 const I32_FULL_SCALE: f64 = 2_147_483_648.0;
 
 /// Case-insensitive patterns that identify the UMA-16 in device ids or descriptions
@@ -93,7 +93,7 @@ pub struct CpalSource<const M: usize> {
     _stream: cpal::Stream,
     /// Interleaved chunks from the audio callback, scaled to [-1, 1)
     rx: Receiver<Vec<f64>>,
-    /// Samples received but not yet returned by `read`, interleaved
+    /// Samples received but not yet returned by [`read`](Self::read), interleaved
     pending: VecDeque<f64>,
     /// Chunks dropped because `read` did not keep up
     dropped: Arc<AtomicUsize>,
@@ -161,11 +161,28 @@ impl<const M: usize> FrameSource<M> for CpalSource<M> {
     /// Never returns `Ok(0)` while the stream runs; returns an error if the stream stopped.
     fn read(&mut self, buf: &mut [f64]) -> std::io::Result<usize> {
         debug_assert!(buf.len().is_multiple_of(M));
-        // 1. If `pending` is empty: block on `self.rx.recv()` and append the chunk.
-        //    `recv` fails only if the callback was dropped: map to an io::Error.
-        // 2. Optionally drain further chunks with `try_recv` without blocking.
-        // 3. Copy whole frames (multiples of M samples) from `pending` into `buf`.
-        // 4. Return the number of frames copied.
-        todo!()
+
+        // If `pending` is empty: block on `self.rx.recv()` and append the chunk.
+        // `recv` fails only if the callback was dropped: map to an io::Error.
+        if self.pending.is_empty() {
+            let chunk = self.rx.recv().map_err(std::io::Error::other)?;
+            debug_assert!(chunk.len().is_multiple_of(M));
+            self.pending.extend(chunk);
+        }
+
+        // Copy whole frames (multiples of M samples) from `pending` into `buf`.
+        let (front, back) = self.pending.as_slices();
+
+        let total = buf.len().min(self.pending.len()); // both multiples of M
+        let n_front = front.len().min(total);
+        let n_back = total - n_front;
+
+        buf[..n_front].copy_from_slice(&front[..n_front]);
+        buf[n_front..total].copy_from_slice(&back[..n_back]);
+
+        self.pending.drain(..total);
+
+        // Return the number of frames copied, not the number of elements
+        Ok(total / M)
     }
 }
