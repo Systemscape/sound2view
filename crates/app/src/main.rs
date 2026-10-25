@@ -1,6 +1,6 @@
 use std::{env, error::Error, fs};
 
-use sound2view::{
+use sound2view_core::{
     dsp::beamformer::{Normalization, Steering, delay_and_sum::Das},
     geometry::mic_array::MicArray,
     pipeline::{Pipeline, run},

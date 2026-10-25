@@ -22,7 +22,7 @@ const FFT_LEN: usize = 1024;
 /// Frames per covariance estimate, one map per L frames
 const L_FRAMES: usize = 40;
 /// Band summed in the power map, in Hz
-const F_LO_HZ: f64 = 2500.0;
+const F_LO_HZ: f64 = 900.0;
 const F_HI_HZ: f64 = 4100.0;
 /// Scan grid width in grid pixels
 const GRID_WIDTH: u32 = 64;
