@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Point3, Vector3};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Camera {
     pub intrinsics: Intrinsics,
     pub mount: Mount,
@@ -35,7 +35,7 @@ impl Camera {
 }
 
 /// Camera intrinsic properties
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Intrinsics {
     /// image width in pixels
     pub width: u32,

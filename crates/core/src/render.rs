@@ -5,7 +5,7 @@ use image::{
     imageops::{self, FilterType},
 };
 
-use crate::{Point3, geometry::camera::Camera};
+use crate::{Point3, pipeline::MapLayout};
 
 /// Marker half length in camera pixels
 const MARKER_HALF_LEN: i64 = 10;
@@ -14,22 +14,16 @@ const MARKER_HALF_LEN: i64 = 10;
 ///
 /// - `power`: row-major like the scan grid, `grid_width * grid_height` values
 /// - `src_pos`: true source positions, array frame
-pub fn map_image(
-    power: &[f64],
-    grid_width: usize,
-    grid_height: usize,
-    camera: &Camera,
-    src_pos: &[Point3],
-) -> RgbImage {
+pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbImage {
     // One grid pixel per map value; x = col, y = row, same as `power[row * w + col]`
-    let w = grid_width;
+    let w = layout.grid_width;
     let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let img = RgbImage::from_fn(w as u32, grid_height as u32, |x, y| {
+    let img = RgbImage::from_fn(w as u32, layout.grid_height as u32, |x, y| {
         power_to_rgb(power[y as usize * w + x as usize], p_max)
     });
 
     // Upscale to camera resolution; Nearest keeps the grid pixels visible
-    let intrinsics = &camera.intrinsics;
+    let intrinsics = &layout.camera.intrinsics;
     let mut big = imageops::resize(
         &img,
         intrinsics.width,
@@ -42,7 +36,7 @@ pub fn map_image(
         if pos.z <= 0.0 {
             continue;
         }
-        let (u, v) = camera.project(pos);
+        let (u, v) = layout.camera.project(pos);
         let (u, v) = (u.round() as i64, v.round() as i64);
 
         for d in -MARKER_HALF_LEN..=MARKER_HALF_LEN {

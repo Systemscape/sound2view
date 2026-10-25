@@ -1,9 +1,11 @@
-use std::{env, error::Error, fs};
+use std::{env, error::Error, fs, ops::ControlFlow};
 
 use sound2view_core::{
+    Point3,
     dsp::beamformer::{Normalization, Steering, delay_and_sum::Das},
     geometry::mic_array::MicArray,
-    pipeline::{Pipeline, run},
+    pipeline::{MapLayout, Pipeline, run},
+    render,
     source::{
         capture::{self, CpalSource},
         simulator::{Simulator, scene::Scene},
@@ -37,21 +39,22 @@ fn run_sim(path: &str) -> Result<(), Box<dyn Error>> {
     let scene = Scene::from_toml(&fs::read_to_string(path)?)?;
     scene.validate();
 
-    let pipeline = Pipeline::new(
-        scene.sample_rate,
-        scene.sources.iter().map(|s| s.pos).collect(),
-        make_das,
-    );
+    let src_pos = scene.sources.iter().map(|s| s.pos).collect();
+    let pipeline = Pipeline::new(scene.sample_rate, make_das);
     let mut sim = Simulator::new(scene, MicArray::uma16());
-    run(&mut sim, pipeline, None)
+
+    // `?` does not convert `+ Send + Sync` away, the cast does
+    run(&mut sim, pipeline, save_maps(src_pos, None)).map_err(|e| e as Box<dyn Error>)?;
+    Ok(())
 }
 
 fn run_mic() -> Result<(), Box<dyn Error>> {
     println!("Capturing from {MIC_DEVICE} at {MIC_SAMPLE_RATE} Hz");
     let mut mic = CpalSource::<16>::new(MIC_DEVICE, MIC_SAMPLE_RATE)?;
 
-    let pipeline = Pipeline::new(MIC_SAMPLE_RATE as f64, Vec::new(), make_das);
-    run(&mut mic, pipeline, Some(MIC_MAPS))?;
+    let pipeline = Pipeline::new(MIC_SAMPLE_RATE as f64, make_das);
+    run(&mut mic, pipeline, save_maps(Vec::new(), Some(MIC_MAPS)))
+        .map_err(|e| e as Box<dyn Error>)?;
 
     println!("dropped {} chunks", mic.dropped());
     Ok(())
@@ -60,4 +63,23 @@ fn run_mic() -> Result<(), Box<dyn Error>> {
 /// DAS with diagonal removal and true-location normalization
 fn make_das(steering: Steering<16>) -> Das<16> {
     Das::new(steering, true, Normalization::TrueLocation)
+}
+
+/// Map handler for `run`: writes each map as `map_NNN.png` with a marker per `src_pos`.
+///
+/// Stops after `max_maps` maps; `None` runs until the stream ends.
+fn save_maps(
+    src_pos: Vec<Point3>,
+    max_maps: Option<usize>,
+) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, Box<dyn Error + Send + Sync>> {
+    let mut i = 0;
+    move |power, layout| {
+        render::map_image(power, layout, &src_pos).save(format!("map_{i:03}.png"))?;
+        i += 1;
+        if max_maps.is_some_and(|max| i >= max) {
+            Ok(ControlFlow::Break(()))
+        } else {
+            Ok(ControlFlow::Continue(()))
+        }
+    }
 }

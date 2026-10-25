@@ -13,7 +13,8 @@ pub struct Stft {
     input_buf: Vec<f64>,
     output_buf: Vec<Complex64>,
     window: Vec<f64>,
-    scale: f64,
+    /// Kept for debugging and testing
+    _scale: f64,
     weights: Vec<f64>,
 }
 
@@ -37,7 +38,7 @@ impl Stft {
             output_buf: plan.make_output_vec(),
             plan,
             window: hann_window,
-            scale,
+            _scale: scale,
             weights,
         }
     }
@@ -204,7 +205,7 @@ mod test {
 
         // Scaling factor should be approx sqrt(8 / 3N)
         assert!(
-            (stft.scale - (8.0 / 3.0 / fft_len as f64).sqrt()).abs() < 1e-12,
+            (stft._scale - (8.0 / 3.0 / fft_len as f64).sqrt()).abs() < 1e-12,
             "Scaling factor should be sqrt(8 / 3N)"
         )
     }

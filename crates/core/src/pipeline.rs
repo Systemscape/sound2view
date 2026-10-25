@@ -1,9 +1,13 @@
 //! Processing chain after the `FrameSource`: STFT, covariance, beamformer and map output.
 
-use std::{error::Error, ops::RangeInclusive, time::Instant};
+use std::{
+    error::Error,
+    ops::{ControlFlow, RangeInclusive},
+    time::Instant,
+};
 
 use crate::{
-    FrameSource, Point3,
+    FrameSource,
     dsp::{
         beamformer::{Beamformer, Steering},
         covariance::Covariance,
@@ -14,7 +18,6 @@ use crate::{
         mic_array::MicArray,
         scan_grid::ScanGrid,
     },
-    render,
 };
 
 /// STFT length N, hop is N/2
@@ -38,23 +41,22 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     beamformer: B,
     /// Bins summed in the power map
     bins: RangeInclusive<usize>,
-    /// Scan grid size in grid pixels
-    grid_width: usize,
-    grid_height: usize,
-    camera: Camera,
-    /// Ground truth source positions for the markers, array frame
-    src_pos: Vec<Point3>,
+    /// Layout of the power map
+    layout: MapLayout,
+}
+
+#[derive(Clone)]
+pub struct MapLayout {
+    pub camera: Camera,
+    pub grid_width: usize,
+    pub grid_height: usize,
 }
 
 impl<B: Beamformer<16>> Pipeline<16, B> {
     /// UMA-16 pipeline for `sample_rate` in Hz; `src_pos` are the true sources for the markers.
     ///
     /// `make_beamformer` builds the beamformer from the steering of this pipeline's scan grid.
-    pub fn new(
-        sample_rate: f64,
-        src_pos: Vec<Point3>,
-        make_beamformer: impl FnOnce(Steering<16>) -> B,
-    ) -> Self {
+    pub fn new(sample_rate: f64, make_beamformer: impl FnOnce(Steering<16>) -> B) -> Self {
         let camera = Camera {
             intrinsics: Intrinsics::from_hfov(1920, 1080, HFOV_DEG.to_radians()),
             mount: Mount::default(),
@@ -80,20 +82,24 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
                 FFT_LEN,
             )),
             bins,
-            grid_width: scan_grid.width(),
-            grid_height: scan_grid.height(),
-            camera,
-            src_pos,
+            layout: MapLayout {
+                camera,
+                grid_width: scan_grid.width(),
+                grid_height: scan_grid.height(),
+            },
         }
     }
 }
 
-/// Read the stream until the end or until `max_maps` maps are written; one power map per `L_FRAMES` STFT frames.
+/// Read `source` through the pipeline; one power map per `L_FRAMES` STFT frames.
+///
+/// Each map is passed to `on_map` together with its [`MapLayout`]. Stops when the source ends
+/// (`Ok(0)`), when `on_map` returns `Break`, or on the first error from `source` or `on_map`.
 pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
     source: &mut S,
     mut pipeline: Pipeline<M, B>,
-    max_maps: Option<usize>,
-) -> Result<(), Box<dyn Error>> {
+    mut on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, Box<dyn Error + Send + Sync>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = vec![0.0; 1024 * M];
     let mut total_frames = 0;
     let mut out = vec![0.0; pipeline.beamformer.n_points()];
@@ -122,19 +128,10 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
                 start.elapsed().as_secs_f64() * 1e3
             );
 
-            render::map_image(
-                &out,
-                pipeline.grid_width,
-                pipeline.grid_height,
-                &pipeline.camera,
-                &pipeline.src_pos,
-            )
-            .save(format!("map_{map_index:03}.png"))?;
+            pipeline.cov.reset();
             map_index += 1;
 
-            pipeline.cov.reset();
-
-            if max_maps.is_some_and(|max| map_index >= max) {
+            if on_map(&out, &pipeline.layout)?.is_break() {
                 break;
             }
         }
