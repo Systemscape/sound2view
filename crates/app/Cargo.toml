@@ -9,3 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 sound2view-core = { path = "../core" }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+eframe = "0.37.0"

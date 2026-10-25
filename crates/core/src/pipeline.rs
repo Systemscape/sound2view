@@ -32,7 +32,7 @@ const GRID_WIDTH: u32 = 64;
 /// Focus distance of the scan grid in meters
 const GRID_Z: f64 = 2.0;
 /// Camera horizontal field of view in degrees
-const HFOV_DEG: f64 = 110.0;
+const HFOV_DEG: f64 = 83.0;
 
 /// Everything after the `FrameSource`: STFT, covariance, beamformer and output
 pub struct Pipeline<const M: usize, B: Beamformer<M>> {

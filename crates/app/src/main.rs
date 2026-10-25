@@ -1,7 +1,8 @@
-use std::{env, error::Error, fs, ops::ControlFlow};
+use std::{env, error::Error, fs, ops::ControlFlow, time::Instant};
 
+use image::RgbaImage;
 use sound2view_core::{
-    Point3,
+    ImageSource, Point3,
     dsp::beamformer::{Normalization, Steering, delay_and_sum::Das},
     geometry::mic_array::MicArray,
     pipeline::{MapLayout, Pipeline, run},
@@ -9,8 +10,11 @@ use sound2view_core::{
     source::{
         capture::{self, CpalSource},
         simulator::{Simulator, scene::Scene},
+        video::{self, CameraSource},
     },
 };
+
+mod gui;
 
 /// Input device id pattern of the UMA-16, see `sound2view probe`
 const MIC_DEVICE: &str = "hw:CARD=UMA16v2";
@@ -18,10 +22,18 @@ const MIC_SAMPLE_RATE: u32 = 48_000;
 /// Number of maps written in mic mode
 const MIC_MAPS: usize = 20;
 
+/// V4L2 index of the camera (`/dev/videoN`), see `sound2view camprobe`
+const CAMERA_INDEX: u32 = 6;
+/// Frames timed in camshot mode
+const CAMSHOT_FRAMES: usize = 60;
+
 /// Usage:
 /// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
 /// - `sound2view mic`: capture from the UMA-16
-/// - `sound2view probe`: list input devices
+/// - `sound2view probe`: list audio input devices
+/// - `sound2view camprobe`: list cameras and their formats
+/// - `sound2view camshot`: time camera frames and save one as `camshot.png`
+/// - `sound2view gui`: live window with the camera image
 fn main() -> Result<(), Box<dyn Error>> {
     let arg = env::args()
         .nth(1)
@@ -29,9 +41,37 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match arg.as_str() {
         "probe" => capture::probe(),
+        "camprobe" => video::probe(),
+        "camshot" => camshot(),
+        "gui" => run_gui(),
         "mic" => run_mic(),
         path => run_sim(path),
     }
+}
+
+fn camshot() -> Result<(), Box<dyn Error>> {
+    let mut camera = CameraSource::new(CAMERA_INDEX)?;
+
+    // The first frame includes stream startup, so it is not timed
+    let mut frame = camera.next_frame().ok_or("no frame from camera")?;
+    let start = Instant::now();
+    for _ in 0..CAMSHOT_FRAMES {
+        frame = camera.next_frame().ok_or("no frame from camera")?;
+    }
+    let dt = start.elapsed().as_secs_f64() / CAMSHOT_FRAMES as f64;
+    println!(
+        "{}x{}: {:.1} ms per frame ({:.1} fps), capture and MJPEG decode",
+        frame.width,
+        frame.height,
+        dt * 1e3,
+        1.0 / dt
+    );
+
+    RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+        .ok_or("pixel buffer does not match the frame size")?
+        .save("camshot.png")?;
+    println!("saved camshot.png");
+    Ok(())
 }
 
 fn run_sim(path: &str) -> Result<(), Box<dyn Error>> {
@@ -82,4 +122,13 @@ fn save_maps(
             Ok(ControlFlow::Continue(()))
         }
     }
+}
+
+fn run_gui() -> Result<(), Box<dyn Error>> {
+    eframe::run_native(
+        "sound2view",
+        eframe::NativeOptions::default(),
+        Box::new(|cc| Ok(Box::new(gui::App::new(cc, CAMERA_INDEX)))),
+    )?;
+    Ok(())
 }

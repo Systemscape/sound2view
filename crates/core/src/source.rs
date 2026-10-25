@@ -1,4 +1,5 @@
-//! Audio sources: live capture and simulator.
+//! Audio and video sources: live capture, simulator and camera.
 
 pub mod capture;
 pub mod simulator;
+pub mod video;

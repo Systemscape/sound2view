@@ -12,3 +12,10 @@ rand_distr = "0.6.0"
 realfft = "3.5.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 toml = { version = "1.1.8+spec-1.1.0", default-features = false, features = ["std", "serde", "parse"] }
+
+# Camera backend per platform
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-v4l"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-avfoundation"] }
