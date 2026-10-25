@@ -2,16 +2,16 @@ use nalgebra::SMatrix;
 
 use crate::{
     Complex64, FrameSource as _, Point3,
-    camera::{Camera, Intrinsics, Mount},
-    covariance::Covariance,
-    mic_array::MicArray,
-    scan_grid::ScanGrid,
-    simulator::{
+    dsp::covariance::Covariance,
+    dsp::stft::{Stft, StftStream},
+    geometry::camera::{Camera, Intrinsics, Mount},
+    geometry::mic_array::MicArray,
+    geometry::scan_grid::ScanGrid,
+    source::simulator::{
         Simulator,
         scene::{MicNoiseParams, Scene, Source},
         signal::{Signal, Sine},
     },
-    stft::{Stft, StftStream},
 };
 
 pub const SAMPLE_RATE: f64 = 48_000.0;

@@ -4,9 +4,9 @@ use nalgebra::SMatrix;
 
 use crate::{
     Complex64,
-    mic_array::MicArray,
-    simulator::{level_to_pressure, scene::Scene},
-    stft::Stft,
+    dsp::stft::Stft,
+    geometry::mic_array::MicArray,
+    source::simulator::{level_to_pressure, scene::Scene},
 };
 
 /// Number of bins around the "real" one to catch leakage
@@ -75,8 +75,8 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
-        Complex64, mic_array::MicArray, reference::reference_covariance, stft::Stft,
-        test_util::*,
+        Complex64, dsp::stft::Stft, geometry::mic_array::MicArray,
+        source::simulator::reference::reference_covariance, test_util::*,
     };
 
     #[test]

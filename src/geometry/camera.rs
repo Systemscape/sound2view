@@ -143,7 +143,7 @@ mod test {
 
     use crate::{
         Point3, Vector3,
-        camera::{Camera, Mount},
+        geometry::camera::{Camera, Mount},
         test_util::test_camera,
     };
 

@@ -2,28 +2,18 @@ use std::ops::RangeInclusive;
 
 use nalgebra::SMatrix;
 
-use crate::{Complex64, mic_array::MicArray, scan_grid::ScanGrid};
-
-pub trait Beamformer {}
-
-/// Normalization c in P = c * a^H R a (Sarradj 2012, steering formulations III and IV)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Normalization {
-    /// c = 1/(a^H a)^2: P = S at the source, but the peak drifts toward farther points
-    TrueLevel,
-    /// c = 1/(M a^H a): peak exactly at the source, P = S * (a^H a)/M there
-    TrueLocation,
-}
+use crate::{
+    Complex64,
+    dsp::beamformer::{Beamformer, Normalization, Steering},
+};
 
 pub struct Das<const M: usize> {
-    /// Precomputed distances per grid point
-    distances: Vec<[f64; M]>,
     /// Normalization factor per grid point
     normalization: Vec<f64>,
-    /// FFT bin spacing in Hz
-    df: f64,
     /// Diagonal removal enabled
     remove_diag: bool,
+    /// Precomputed steering vector
+    steering: Steering<M>,
 }
 
 impl<const M: usize> Das<M> {
@@ -36,50 +26,37 @@ impl<const M: usize> Das<M> {
     /// - `fft_len`: FFT length N
     /// - `remove_diag`: turn on diagonal removal
     /// - `normalization`: see [`Normalization`]
-    pub fn new(
-        scan_grid: &ScanGrid,
-        mic_array: &MicArray<M>,
-        f_s: f64,
-        fft_len: usize,
-        remove_diag: bool,
-        normalization: Normalization,
-    ) -> Self {
-        // Distances from each mic to each grid point
-        let distances = Vec::from_iter(
-            scan_grid
-                .points()
-                .iter()
-                .map(|pos| mic_array.get_distance_from(pos)),
-        );
-
+    pub fn new(steering: Steering<M>, remove_diag: bool, normalization: Normalization) -> Self {
         // With g_m = |a_m|^2 = 1/r_m^2 and sum(g_m) = a^H a:
         // - TrueLevel: `1/sum(g_m)^2`, with diagonal removal `1/(sum(g_m)^2 - sum(g_m^2))`
         // - TrueLocation: `1/(M sum(g_m))`, with diagonal removal `1/((M - 1) sum(g_m))`
-        let normalization = Vec::from_iter(distances.iter().map(|r| {
-            let g = r.map(|r_m| r_m.powi(-2));
-            let sum_g: f64 = g.iter().sum();
-            let denom = match (normalization, remove_diag) {
-                (Normalization::TrueLevel, false) => sum_g.powi(2),
-                (Normalization::TrueLevel, true) => {
-                    sum_g.powi(2) - g.iter().map(|g_m| g_m * g_m).sum::<f64>()
-                }
-                (Normalization::TrueLocation, false) => M as f64 * sum_g,
-                (Normalization::TrueLocation, true) => (M - 1) as f64 * sum_g,
-            };
-            1.0 / denom
-        }));
+        let normalization = (0..steering.n_points())
+            .map(|i| {
+                let g = steering.gains(i);
+                let sum_g: f64 = g.iter().sum();
+                let denom = match (normalization, remove_diag) {
+                    (Normalization::TrueLevel, false) => sum_g.powi(2),
+                    (Normalization::TrueLevel, true) => {
+                        sum_g.powi(2) - g.iter().map(|g_m| g_m * g_m).sum::<f64>()
+                    }
+                    (Normalization::TrueLocation, false) => M as f64 * sum_g,
+                    (Normalization::TrueLocation, true) => (M - 1) as f64 * sum_g,
+                };
+                1.0 / denom
+            })
+            .collect();
 
         Self {
-            distances,
             normalization,
-            df: f_s / fft_len as f64,
             remove_diag,
+            steering,
         }
     }
+}
 
-    /// Get the number of points in the scanning grid
-    pub fn n_points(&self) -> usize {
-        self.distances.len()
+impl<const M: usize> Beamformer<M> for Das<M> {
+    fn n_points(&self) -> usize {
+        self.steering.n_points()
     }
 
     /// Compute the power map
@@ -92,7 +69,7 @@ impl<const M: usize> Das<M> {
     /// - `bins`: absolute bin indices
     /// - Sums power over `bins` of the fft
     /// - `out`: row-major like the [`ScanGrid`], overwritten
-    pub fn power_map(
+    fn power_map(
         &self,
         cov: &[SMatrix<Complex64, M, M>],
         bins: RangeInclusive<usize>,
@@ -100,7 +77,7 @@ impl<const M: usize> Das<M> {
     ) {
         assert_eq!(
             out.len(),
-            self.distances.len(),
+            self.steering.n_points(),
             "length of `out` must match number of grid points"
         );
         assert!(
@@ -113,28 +90,21 @@ impl<const M: usize> Das<M> {
 
         for k in bins {
             // frequency of this bin
-            let f_k = k as f64 * self.df;
 
             let cov_k = &cov[k];
-            for ((r_p, normalization), out_p) in self
-                .distances
-                .iter()
-                .zip(self.normalization.iter())
-                .zip(out.iter_mut())
-            {
-                let a = MicArray::steering_from_distances(r_p, f_k);
-
+            for (i, (c, out_i)) in self.normalization.iter().zip(out.iter_mut()).enumerate() {
+                let a = self.steering.vector(i, k);
                 let mut p = a.dotc(&(cov_k * a)).re;
 
                 if self.remove_diag {
-                    let diag = r_p
+                    // sum_m |a_m|^2 R_mm, the diagonal part of a^H R a
+                    p -= a
                         .iter()
                         .enumerate()
-                        .map(|(m, r_m)| r_m.powi(-2) * cov_k[(m, m)].re)
+                        .map(|(m, a_m)| a_m.norm_sqr() * cov_k[(m, m)].re)
                         .sum::<f64>();
-                    p -= diag;
                 }
-                *out_p += p * normalization;
+                *out_i += p * c;
             }
         }
     }
@@ -145,10 +115,15 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
-        beamformer::{Das, Normalization},
-        mic_array::MicArray,
-        reference::reference_covariance,
-        stft::Stft,
+        dsp::{
+            beamformer::{
+                Beamformer as _, Steering,
+                delay_and_sum::{Das, Normalization},
+            },
+            stft::Stft,
+        },
+        geometry::mic_array::MicArray,
+        source::simulator::reference::reference_covariance,
         test_util::{
             BIN, F_SINE, FFT_LEN, SAMPLE_RATE, sine_bin_power, stream_covariance, test_scan_grid,
             test_scene,
@@ -165,7 +140,8 @@ mod test {
 
         let scan_grid = test_scan_grid();
         let mic_array = MicArray::uma16();
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let das_beamformer = Das::new(steering, false, Normalization::TrueLevel);
 
         // 1. Camera + ScanGrid, pick p_0 = grid.points()[grid.index(row, col)]
         let p_0 = scan_grid.points()[scan_grid.index(row, col)];
@@ -216,12 +192,13 @@ mod test {
         scene.sources[0].pos = scan_grid.points()[idx_source];
         let mic_array = MicArray::uma16();
         let stft = Stft::new(FFT_LEN);
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
 
         // 2. R = reference_covariance(...)
         let cov_ref = reference_covariance(&scene, &mic_array, &stft);
 
         // 3. power_map over BIN..=BIN
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
+        let das_beamformer = Das::new(steering, false, Normalization::TrueLevel);
         let mut power = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power);
 
@@ -256,12 +233,13 @@ mod test {
         let idx_source = scan_grid.index(scan_grid.height() / 2, scan_grid.width() / 2);
         scene.sources[0].pos = scan_grid.points()[idx_source];
         let mic_array = MicArray::uma16();
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
 
         let cov_ref = reference_covariance(&scene, &mic_array, &Stft::new(FFT_LEN));
         let (cov_est, l) = stream_covariance(&scene, &mic_array);
         assert!(l > 0, "no STFT frames");
 
-        let das_beamformer = Das::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN, false, Normalization::TrueLevel);
+        let das_beamformer = Das::new(steering, false, Normalization::TrueLevel);
         let mut power_ref = vec![0.0; scan_grid.points().len()];
         let mut power_est = vec![0.0; scan_grid.points().len()];
         das_beamformer.power_map(&cov_ref, BIN..=BIN, &mut power_ref);

@@ -1,4 +1,4 @@
-use crate::{Point3, camera::Camera};
+use crate::{Point3, geometry::camera::Camera};
 
 pub struct ScanGrid {
     /// Scan grid width in "pixels"
@@ -54,7 +54,7 @@ impl ScanGrid {
 
 #[cfg(test)]
 mod test {
-    use crate::{scan_grid::ScanGrid, test_util::test_camera};
+    use crate::{geometry::scan_grid::ScanGrid, test_util::test_camera};
 
     #[test]
     fn points_len_w_times_h() {

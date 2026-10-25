@@ -3,7 +3,7 @@ use std::f64::consts::{PI, SQRT_2};
 use rand::{RngExt, SeedableRng, rngs::ChaCha8Rng};
 use serde::Deserialize;
 
-use crate::simulator::level_to_pressure;
+use crate::source::simulator::level_to_pressure;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -159,7 +159,7 @@ impl Noise {
 #[cfg(test)]
 mod tests {
 
-    use crate::simulator::P_REF;
+    use crate::source::simulator::P_REF;
 
     use super::*;
 

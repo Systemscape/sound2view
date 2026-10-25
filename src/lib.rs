@@ -1,12 +1,8 @@
-pub mod beamformer;
-pub mod camera;
-pub mod capture;
-pub mod covariance;
-pub mod mic_array;
-pub mod reference;
-pub mod scan_grid;
-pub mod simulator;
-pub mod stft;
+pub mod dsp;
+pub mod geometry;
+pub mod pipeline;
+pub mod render;
+pub mod source;
 
 #[cfg(test)]
 pub(crate) mod test_util;

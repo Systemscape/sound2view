@@ -118,7 +118,7 @@ impl MicArray<16> {
 
 #[cfg(test)]
 mod test {
-    use crate::{Point3, Vector3, distance_to_delay, mic_array::MicArray};
+    use crate::{Point3, Vector3, distance_to_delay, geometry::mic_array::MicArray};
 
     /// All 16 positions against Acoular `minidsp_uma-16.xml` (>= 24.03), channel = point - 1.
     #[test]

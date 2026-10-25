@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::{
     Point3,
-    simulator::{level_to_pressure, signal::Signal},
+    source::simulator::{level_to_pressure, signal::Signal},
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -90,7 +90,7 @@ impl MicNoise {
 mod tests {
     use crate::{
         Point3,
-        simulator::{
+        source::simulator::{
             level_to_pressure,
             scene::{MicNoise, MicNoiseParams, Scene},
             signal::Signal,

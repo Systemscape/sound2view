@@ -2,13 +2,14 @@ use std::cmp::min;
 
 use crate::{
     FrameSource, distance_to_delay,
-    mic_array::MicArray,
-    simulator::{
+    geometry::mic_array::MicArray,
+    source::simulator::{
         scene::{MicNoise, Scene},
         signal::Signal,
     },
 };
 
+pub mod reference;
 pub mod scene;
 pub mod signal;
 
@@ -109,7 +110,8 @@ mod tests {
     use std::f64::consts::PI;
 
     use crate::{
-        FrameSource, distance_to_delay, mic_array::MicArray, simulator::Simulator, test_util::*,
+        FrameSource, distance_to_delay, geometry::mic_array::MicArray,
+        source::simulator::Simulator, test_util::*,
     };
 
     const DURATION_S: f64 = 1.0;

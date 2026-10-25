@@ -136,9 +136,9 @@ mod test {
 
     use crate::{
         Complex64, distance_to_delay,
-        mic_array::MicArray,
-        simulator::Simulator,
-        stft::{Stft, StftStream},
+        dsp::stft::{Stft, StftStream},
+        geometry::mic_array::MicArray,
+        source::simulator::Simulator,
         test_util::*,
     };
 
@@ -273,9 +273,8 @@ mod test {
         // Bin BIN of the last STFT frame; the sine is in steady state from t = 0
         let mut x: Option<SVector<Complex64, 16>> = None;
 
-        StftStream::new(Stft::new(FFT_LEN)).push(&samples, |snapshots, _l| {
-            x = Some(snapshots[BIN])
-        });
+        StftStream::new(Stft::new(FFT_LEN))
+            .push(&samples, |snapshots, _l| x = Some(snapshots[BIN]));
 
         let x = x.expect("at least one STFT frame");
 
