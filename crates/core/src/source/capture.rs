@@ -4,14 +4,15 @@ use std::{
     collections::VecDeque,
     error::Error,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
+    time::Duration,
 };
 
 use cpal::{
-    BufferSize, StreamConfig,
+    BufferSize, ErrorKind, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
@@ -87,6 +88,25 @@ pub fn probe() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("no audio input device matching {0:?}")]
+    NotFound(String),
+    #[error("audio device: {0}")]
+    Device(#[from] cpal::Error),
+    #[error("audio stream: {0}")]
+    Stream(cpal::Error),
+    #[error("no audio data for {} s", .0.as_secs_f64())]
+    NoData(Duration),
+    #[error("audio stream closed")]
+    Closed,
+}
+
+/// `read` gives up after this long without data (e.g. device unplugged without an error)
+const NO_DATA_TIMEOUT: Duration = Duration::from_secs(2);
+/// `read` checks for stream errors at least this often while waiting
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Live capture from an `M`-channel input device with I32 samples
 pub struct CpalSource<const M: usize> {
     /// Keeps the capture running; capture stops when dropped
@@ -97,6 +117,8 @@ pub struct CpalSource<const M: usize> {
     pending: VecDeque<f64>,
     /// Chunks dropped because `read` did not keep up
     dropped: Arc<AtomicUsize>,
+    /// First fatal error reported by the stream's error callback
+    stream_error: Arc<Mutex<Option<cpal::Error>>>,
     sample_rate: f64,
 }
 
@@ -105,12 +127,12 @@ impl<const M: usize> CpalSource<M> {
     ///
     /// - `id_pattern`: e.g. `"hw:CARD=UMA16v2"`, see [`probe`]
     /// - `sample_rate`: in Hz, must be supported by the device
-    pub fn new(id_pattern: &str, sample_rate: u32) -> Result<Self, Box<dyn Error>> {
+    pub fn new(id_pattern: &str, sample_rate: u32) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let device = host
             .input_devices()?
             .find(|d| d.id().is_ok_and(|id| id.to_string().contains(id_pattern)))
-            .ok_or_else(|| format!("no input device matching {id_pattern:?}"))?;
+            .ok_or_else(|| CaptureError::NotFound(id_pattern.to_string()))?;
 
         let config = StreamConfig {
             channels: M as u16,
@@ -121,6 +143,8 @@ impl<const M: usize> CpalSource<M> {
         let (tx, rx): (SyncSender<Vec<f64>>, _) = sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
         let dropped_cb = Arc::clone(&dropped);
+        let stream_error = Arc::new(Mutex::new(None));
+        let stream_error_cb = Arc::clone(&stream_error);
 
         let stream = device.build_input_stream(
             config,
@@ -131,7 +155,16 @@ impl<const M: usize> CpalSource<M> {
                     dropped_cb.fetch_add(1, Ordering::Relaxed);
                 }
             },
-            |e| eprintln!("capture error: {e}"),
+            move |e: cpal::Error| match e.kind() {
+                // Glitches, the stream keeps running
+                ErrorKind::Xrun | ErrorKind::RealtimeDenied | ErrorKind::DeviceChanged => {
+                    eprintln!("audio stream: {e}");
+                }
+                // E.g. device unplugged: keep the first error for `read`
+                _ => {
+                    stream_error_cb.lock().unwrap().get_or_insert(e);
+                }
+            },
             None,
         )?;
         stream.play()?;
@@ -141,6 +174,7 @@ impl<const M: usize> CpalSource<M> {
             rx,
             pending: VecDeque::new(),
             dropped,
+            stream_error,
             sample_rate: sample_rate as f64,
         })
     }
@@ -148,6 +182,27 @@ impl<const M: usize> CpalSource<M> {
     /// Number of chunks dropped so far because `read` did not keep up
     pub fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Block until the next chunk arrives; error on a stream error, a closed stream or
+    /// `NO_DATA_TIMEOUT` without data.
+    fn next_chunk(&self) -> Result<Vec<f64>, CaptureError> {
+        let mut waited = Duration::ZERO;
+        loop {
+            if let Some(e) = self.stream_error.lock().unwrap().clone() {
+                return Err(CaptureError::Stream(e));
+            }
+            match self.rx.recv_timeout(POLL_INTERVAL) {
+                Ok(chunk) => return Ok(chunk),
+                Err(RecvTimeoutError::Disconnected) => return Err(CaptureError::Closed),
+                Err(RecvTimeoutError::Timeout) => {
+                    waited += POLL_INTERVAL;
+                    if waited >= NO_DATA_TIMEOUT {
+                        return Err(CaptureError::NoData(waited));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -158,14 +213,13 @@ impl<const M: usize> FrameSource<M> for CpalSource<M> {
 
     /// Blocks until at least one frame is available, then fills as much of `buf` as possible.
     ///
-    /// Never returns `Ok(0)` while the stream runs; returns an error if the stream stopped.
+    /// Never returns `Ok(0)` while the stream runs. A [`CaptureError`] (stream error, stream
+    /// closed, no data for `NO_DATA_TIMEOUT`) is returned wrapped in an `io::Error`.
     fn read(&mut self, buf: &mut [f64]) -> std::io::Result<usize> {
         debug_assert!(buf.len().is_multiple_of(M));
 
-        // If `pending` is empty: block on `self.rx.recv()` and append the chunk.
-        // `recv` fails only if the callback was dropped: map to an io::Error.
         if self.pending.is_empty() {
-            let chunk = self.rx.recv().map_err(std::io::Error::other)?;
+            let chunk = self.next_chunk().map_err(std::io::Error::other)?;
             debug_assert!(chunk.len().is_multiple_of(M));
             self.pending.extend(chunk);
         }

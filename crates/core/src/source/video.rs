@@ -3,6 +3,7 @@
 use std::error::Error;
 
 use nokhwa::{
+    NokhwaError,
     Camera,
     pixel_format::RgbAFormat,
     query,
@@ -47,6 +48,14 @@ pub fn probe() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum VideoError {
+    #[error("no camera with {0:?} in its name")]
+    NotFound(String),
+    #[error("camera: {0}")]
+    Camera(#[from] NokhwaError),
+}
+
 /// Live camera capture, frames converted to RGBA
 pub struct CameraSource {
     camera: Camera,
@@ -55,7 +64,7 @@ pub struct CameraSource {
 impl CameraSource {
     /// Open camera `index` (see [`probe`]) with MJPEG at `width` x `height` and `fps`, and start
     /// streaming.
-    pub fn new(index: u32, width: u32, height: u32, fps: u32) -> Result<Self, Box<dyn Error>> {
+    pub fn new(index: u32, width: u32, height: u32, fps: u32) -> Result<Self, VideoError> {
         let format = RequestedFormatType::Exact(CameraFormat::new(
             Resolution::new(width, height),
             FrameFormat::MJPEG,
@@ -76,17 +85,13 @@ impl CameraSource {
     ///
     /// One camera can show up as several devices (e.g. a V4L2 metadata node that cannot
     /// stream), so all matches are tried in order. Unlike the index, the name survives replugging.
-    pub fn open_by_name(
-        name: &str,
-        width: u32,
-        height: u32,
-        fps: u32,
-    ) -> Result<Self, Box<dyn Error>> {
-        let name = name.to_lowercase();
+    /// Returns the error of the last match that failed, or `NotFound` if none matched.
+    pub fn open_by_name(name: &str, width: u32, height: u32, fps: u32) -> Result<Self, VideoError> {
+        let lower = name.to_lowercase();
         let mut last_error = None;
 
         for info in query(ApiBackend::Auto)? {
-            if !info.human_name().to_lowercase().contains(&name) {
+            if !info.human_name().to_lowercase().contains(&lower) {
                 continue;
             }
             match Self::new(info.index().as_index()?, width, height, fps) {
@@ -95,23 +100,18 @@ impl CameraSource {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| format!("no camera with {name:?} in its name").into()))
+        Err(last_error.unwrap_or_else(|| VideoError::NotFound(name.to_string())))
     }
 }
 
 impl ImageSource for CameraSource {
-    fn next_frame(&mut self) -> Option<VideoFrame> {
-        let frame = match self.camera.frame() {
-            Ok(frame) => frame,
-            Err(e) => {
-                eprintln!("camera frame: {e}");
-                return None;
-            }
-        };
+    type Error = VideoError;
 
-        let image = frame.decode_image::<RgbAFormat>().ok()?;
+    /// Blocks until the next frame; capture and MJPEG decode errors are returned.
+    fn next_frame(&mut self) -> Result<VideoFrame, VideoError> {
+        let image = self.camera.frame()?.decode_image::<RgbAFormat>()?;
 
-        Some(VideoFrame {
+        Ok(VideoFrame {
             width: image.width(),
             height: image.height(),
             pixels: image.into_raw(),

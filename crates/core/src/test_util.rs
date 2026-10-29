@@ -64,7 +64,7 @@ pub fn stream_covariance<const M: usize>(
     scene: &Scene,
     mic_array: &MicArray<M>,
 ) -> (Vec<SMatrix<Complex64, M, M>>, usize) {
-    let mut sim = Simulator::new(scene.clone(), mic_array.clone());
+    let mut sim = Simulator::new(scene.clone(), mic_array.clone()).unwrap();
     let mut stream = StftStream::<M>::new(Stft::new(FFT_LEN));
     let mut cov = Covariance::<M>::new(FFT_LEN / 2 + 1);
 

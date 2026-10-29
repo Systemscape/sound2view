@@ -32,10 +32,18 @@ grid_width = 64
 grid_z = 2.0
 
 [beamformer]
-# "das" or "functional" (selectable in the GUI)
+# "das", "functional" or "clean_sc" (selectable in the GUI)
 method = "functional"
 # Exponent of functional beamforming: larger is sharper, more sensitive to model errors
 nu = 20.0
+# CLEAN-SC loop gain in (0, 1]
+clean_gain = 0.9
+# CLEAN-SC: maximum number of removed sources per frequency bin (adjustable in the GUI)
+clean_max_iter = 10
+# CLEAN-SC: stop when the strongest remaining source is this many dB below the first
+clean_stop_db = 20.0
+# CLEAN-SC: width (standard deviation) of the Gaussian clean beam in grid cells; 0: single points
+clean_beam_cells = 1.5
 
 [display]
 # Overlay range in dB below the map maximum (adjustable in the GUI)

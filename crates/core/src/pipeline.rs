@@ -1,7 +1,7 @@
 //! Processing chain after the `FrameSource`: STFT, covariance, beamformer and map output.
 
 use std::{
-    error::Error,
+    io,
     ops::{ControlFlow, RangeInclusive},
     time::Instant,
 };
@@ -9,7 +9,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    FrameSource,
+    BoxError, FrameSource,
     dsp::{
         beamformer::{Beamformer, Steering},
         covariance::SlidingCovariance,
@@ -52,6 +52,40 @@ impl Default for PipelineConfig {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    #[error("invalid pipeline config: {0}")]
+    InvalidConfig(String),
+    #[error("reading the source: {0}")]
+    Source(#[from] io::Error),
+    #[error("map handler: {0}")]
+    MapHandler(#[source] BoxError),
+}
+
+impl PipelineConfig {
+    /// Error if a value cannot work, e.g. an empty band or an odd FFT length.
+    pub fn validate(&self, sample_rate: f64) -> Result<(), PipelineError> {
+        let invalid = |message: &str| Err(PipelineError::InvalidConfig(message.to_string()));
+
+        if self.fft_len < 2 || !self.fft_len.is_multiple_of(2) {
+            return invalid("fft_len must be even and at least 2");
+        }
+        if self.memory_frames == 0 || self.map_every == 0 {
+            return invalid("memory_frames and map_every must be at least 1");
+        }
+        if !(0.0 <= self.f_lo_hz && self.f_lo_hz < self.f_hi_hz) {
+            return invalid("band: 0 <= f_lo_hz < f_hi_hz required");
+        }
+        if self.f_lo_hz >= sample_rate / 2.0 {
+            return invalid("band: f_lo_hz must be below sample_rate/2");
+        }
+        if self.grid_width == 0 || self.grid_z <= 0.0 {
+            return invalid("grid_width must be at least 1 and grid_z > 0");
+        }
+        Ok(())
+    }
+}
+
 /// Everything after the `FrameSource`: STFT, covariance, beamformer and output
 pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     stream: StftStream<M>,
@@ -76,18 +110,15 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
     /// UMA-16 pipeline for `sample_rate` in Hz; the scan grid covers the field of view of `camera`.
     ///
     /// `make_beamformer` builds the beamformer from the steering of this pipeline's scan grid.
+    ///
+    /// Error if `config` is invalid, see [`PipelineConfig::validate`].
     pub fn new(
         sample_rate: f64,
         config: &PipelineConfig,
         camera: Camera,
         make_beamformer: impl FnOnce(Steering<16>) -> B,
-    ) -> Self {
-        // TODO(Julian): config errors as `Result` with the thiserror plan
-        assert!(
-            config.f_lo_hz < config.f_hi_hz,
-            "band: f_lo_hz must be below f_hi_hz"
-        );
-        assert!(config.map_every > 0, "map_every must be at least 1");
+    ) -> Result<Self, PipelineError> {
+        config.validate(sample_rate)?;
 
         let scan_grid = ScanGrid::new(&camera, config.grid_width, config.grid_z);
 
@@ -106,7 +137,7 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
             config.map_every
         );
 
-        Self {
+        Ok(Self {
             stream: StftStream::new(Stft::new(config.fft_len)),
             cov: SlidingCovariance::new(n_bins, config.memory_frames),
             beamformer: make_beamformer(Steering::new(
@@ -122,7 +153,7 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
                 grid_width: scan_grid.width(),
                 grid_height: scan_grid.height(),
             },
-        }
+        })
     }
 }
 
@@ -135,8 +166,8 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
 pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
     source: &mut S,
     mut pipeline: Pipeline<M, B>,
-    mut on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, Box<dyn Error + Send + Sync>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    mut on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
+) -> Result<(), PipelineError> {
     let mut buf = vec![0.0; 1024 * M];
     let mut total_frames = 0;
     let mut out = vec![0.0; pipeline.beamformer.n_points()];
@@ -170,7 +201,8 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             new_frames = 0;
             map_index += 1;
 
-            if on_map(&out, &pipeline.layout)?.is_break() {
+            let flow = on_map(&out, &pipeline.layout).map_err(PipelineError::MapHandler)?;
+            if flow.is_break() {
                 break;
             }
         }

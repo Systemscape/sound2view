@@ -268,7 +268,7 @@ mod test {
         // Asymmetric position, so all 16 distances differ. F_SINE is a bin center:
         // a delayed tone stays a pure bin-center tone, so the ratio is exact.
         let mic_array = MicArray::uma16();
-        let mut sim = Simulator::new(test_scene(-1000.0, 0.1), mic_array.clone());
+        let mut sim = Simulator::new(test_scene(-1000.0, 0.1), mic_array.clone()).unwrap();
         let samples = read_all(&mut sim, 4096);
 
         // Bin BIN of the last STFT frame; the sine is in steady state from t = 0

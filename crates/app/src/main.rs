@@ -2,10 +2,12 @@ use std::{env, error::Error, fs, ops::ControlFlow, time::Instant};
 
 use image::RgbaImage;
 use sound2view_core::{
-    FrameSource, ImageSource, Point3,
-    dsp::beamformer::{Normalization, delay_and_sum::Das, functional::Functional},
+    BoxError, FrameSource, ImageSource, Point3,
+    dsp::beamformer::{
+        Normalization, clean_sc::CleanSc, delay_and_sum::Das, functional::Functional,
+    },
     geometry::mic_array::MicArray,
-    pipeline::{MapLayout, Pipeline, run},
+    pipeline::{MapLayout, Pipeline, PipelineError, run},
     render,
     source::{
         capture::{self, CpalSource},
@@ -19,9 +21,6 @@ use crate::config::{CONFIG_PATH, Config, Method};
 mod config;
 mod gui;
 mod theme;
-
-/// Error type of `run` and its map handlers; `Send` so it can cross threads
-type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Number of maps written in mic mode
 const MIC_MAPS: usize = 20;
@@ -55,10 +54,10 @@ fn camshot(config: &Config) -> Result<(), Box<dyn Error>> {
     let mut camera = CameraSource::open_by_name(&c.name, c.width, c.height, c.fps)?;
 
     // The first frame includes stream startup, so it is not timed
-    let mut frame = camera.next_frame().ok_or("no frame from camera")?;
+    let mut frame = camera.next_frame()?;
     let start = Instant::now();
     for _ in 0..CAMSHOT_FRAMES {
-        frame = camera.next_frame().ok_or("no frame from camera")?;
+        frame = camera.next_frame()?;
     }
     let dt = start.elapsed().as_secs_f64() / CAMSHOT_FRAMES as f64;
     println!(
@@ -79,15 +78,12 @@ fn camshot(config: &Config) -> Result<(), Box<dyn Error>> {
 fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     println!("Reading scene from {path}");
     let scene = Scene::from_toml(&fs::read_to_string(path)?)?;
-    scene.validate();
 
     let src_pos = scene.sources.iter().map(|s| s.pos).collect();
     let sample_rate = scene.sample_rate;
-    let mut sim = Simulator::new(scene, MicArray::uma16());
+    let mut sim = Simulator::new(scene, MicArray::uma16())?;
 
-    // `?` does not convert `+ Send + Sync` away, the cast does
-    run_configured(&mut sim, sample_rate, config, save_maps(src_pos, None))
-        .map_err(|e| e as Box<dyn Error>)?;
+    run_configured(&mut sim, sample_rate, config, save_maps(src_pos, None))?;
     Ok(())
 }
 
@@ -97,8 +93,7 @@ fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
     let mut mic = CpalSource::<16>::new(&audio.device, audio.sample_rate)?;
 
     let sample_rate = audio.sample_rate as f64;
-    run_configured(&mut mic, sample_rate, config, save_maps(Vec::new(), Some(MIC_MAPS)))
-        .map_err(|e| e as Box<dyn Error>)?;
+    run_configured(&mut mic, sample_rate, config, save_maps(Vec::new(), Some(MIC_MAPS)))?;
 
     println!("dropped {} chunks", mic.dropped());
     Ok(())
@@ -112,22 +107,34 @@ fn run_configured<S: FrameSource<16>>(
     sample_rate: f64,
     config: &Config,
     on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
-) -> Result<(), BoxError> {
+) -> Result<(), PipelineError> {
     let camera = config.camera.camera();
     let pipeline = &config.pipeline;
+    let b = &config.beamformer;
 
-    match config.beamformer.method {
+    match b.method {
         Method::Das => {
             let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
                 Das::new(steering, true, Normalization::TrueLocation)
-            });
+            })?;
             run(source, pipeline, on_map)
         }
         Method::Functional => {
-            let nu = config.beamformer.nu;
             let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
-                Functional::new(steering, nu)
-            });
+                Functional::new(steering, b.nu)
+            })?;
+            run(source, pipeline, on_map)
+        }
+        Method::CleanSc => {
+            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+                CleanSc::new(
+                    steering,
+                    b.clean_gain,
+                    b.clean_max_iter,
+                    b.clean_stop_db,
+                    b.clean_beam_cells,
+                )
+            })?;
             run(source, pipeline, on_map)
         }
     }

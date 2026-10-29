@@ -26,7 +26,11 @@ impl Config {
     /// Read `path`; a missing file gives the defaults.
     pub fn load(path: &str) -> Result<Self, Box<dyn Error>> {
         match fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => {
+                let config: Self = toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+                config.validate().map_err(|e| format!("{path}: {e}"))?;
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 println!("{path} not found, using defaults");
                 Ok(Self::default())
@@ -97,15 +101,17 @@ pub enum Method {
     /// Delay and sum with diagonal removal and true-location normalization
     Das,
     Functional,
+    CleanSc,
 }
 
 impl Method {
-    pub const ALL: [Method; 2] = [Method::Das, Method::Functional];
+    pub const ALL: [Method; 3] = [Method::Das, Method::Functional, Method::CleanSc];
 
     pub fn label(self) -> &'static str {
         match self {
             Method::Das => "Delay and sum",
             Method::Functional => "Functional",
+            Method::CleanSc => "CLEAN-SC",
         }
     }
 }
@@ -117,6 +123,14 @@ pub struct BeamformerConfig {
     /// Exponent nu of functional beamforming; larger is sharper but more sensitive to model
     /// errors
     pub nu: f64,
+    /// CLEAN-SC loop gain in (0, 1]
+    pub clean_gain: f64,
+    /// CLEAN-SC: maximum number of removed sources per frequency bin
+    pub clean_max_iter: usize,
+    /// CLEAN-SC: stop when the strongest remaining source is this many dB below the first
+    pub clean_stop_db: f64,
+    /// CLEAN-SC: standard deviation of the Gaussian clean beam in grid cells (0: single points)
+    pub clean_beam_cells: f64,
 }
 
 impl Default for BeamformerConfig {
@@ -124,6 +138,10 @@ impl Default for BeamformerConfig {
         Self {
             method: Method::Functional,
             nu: 20.0,
+            clean_gain: 0.9,
+            clean_max_iter: 10,
+            clean_stop_db: 20.0,
+            clean_beam_cells: 1.5,
         }
     }
 }
@@ -138,5 +156,31 @@ pub struct DisplayConfig {
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self { db_range: 3.0 }
+    }
+}
+
+impl Config {
+    /// Error for values the pipeline or GUI cannot use. Pipeline values that depend on the
+    /// sample rate are checked again by `Pipeline::new`.
+    pub fn validate(&self) -> Result<(), String> {
+        let b = &self.beamformer;
+        if b.nu < 1.0 {
+            return Err("beamformer.nu must be at least 1".to_string());
+        }
+        if !(b.clean_gain > 0.0 && b.clean_gain <= 1.0) {
+            return Err("beamformer.clean_gain must be in (0, 1]".to_string());
+        }
+        if b.clean_max_iter == 0 {
+            return Err("beamformer.clean_max_iter must be at least 1".to_string());
+        }
+        if b.clean_stop_db < 0.0 || b.clean_beam_cells < 0.0 {
+            return Err("beamformer.clean_stop_db and clean_beam_cells must be >= 0".to_string());
+        }
+        if self.display.db_range <= 0.0 {
+            return Err("display.db_range must be > 0".to_string());
+        }
+        self.pipeline
+            .validate(self.audio.sample_rate as f64)
+            .map_err(|e| e.to_string())
     }
 }

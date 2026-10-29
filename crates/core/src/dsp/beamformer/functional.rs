@@ -1,6 +1,7 @@
 use std::ops::RangeInclusive;
 
 use nalgebra::{Const, DefaultAllocator, DimDiff, DimSub, SMatrix, U1, allocator::Allocator};
+use rayon::prelude::*;
 
 use crate::{
     Complex64,
@@ -77,12 +78,14 @@ where
                 .apply(|lambda| *lambda = lambda.max(0.0).powf(1.0 / self.nu));
             let cov_root = eigen.recompose();
 
-            for (i, (inv_norm2, out_i)) in self.inv_norm2.iter().zip(out.iter_mut()).enumerate() {
+            // Grid points are independent: parallel over points, bins stay sequential
+            let points = self.inv_norm2.par_iter().zip(out.par_iter_mut()).enumerate();
+            points.for_each(|(i, (inv_norm2, out_i))| {
                 let a = self.steering.vector(i, k);
                 // w^H R^(1/nu) w with w = a / |a|
                 let q = a.dotc(&(cov_root * a)).re * inv_norm2;
                 *out_i += q.max(0.0).powf(self.nu) / M as f64;
-            }
+            });
         }
     }
 }
