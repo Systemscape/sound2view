@@ -2,8 +2,8 @@ use std::{env, error::Error, fs, ops::ControlFlow, time::Instant};
 
 use image::RgbaImage;
 use sound2view_core::{
-    ImageSource, Point3,
-    dsp::beamformer::{Normalization, Steering, delay_and_sum::Das, functional::Functional},
+    FrameSource, ImageSource, Point3,
+    dsp::beamformer::{Normalization, delay_and_sum::Das, functional::Functional},
     geometry::mic_array::MicArray,
     pipeline::{MapLayout, Pipeline, run},
     render,
@@ -14,21 +14,21 @@ use sound2view_core::{
     },
 };
 
+use crate::config::{CONFIG_PATH, Config, Method};
+
+mod config;
 mod gui;
 mod theme;
 
-/// Input device id pattern of the UMA-16, see `sound2view probe`
-const MIC_DEVICE: &str = "hw:CARD=UMA16v2";
-const MIC_SAMPLE_RATE: u32 = 48_000;
+/// Error type of `run` and its map handlers; `Send` so it can cross threads
+type BoxError = Box<dyn Error + Send + Sync>;
+
 /// Number of maps written in mic mode
 const MIC_MAPS: usize = 20;
-
-/// V4L2 index of the camera (`/dev/videoN`), see `sound2view camprobe`
-const CAMERA_INDEX: u32 = 6;
 /// Frames timed in camshot mode
 const CAMSHOT_FRAMES: usize = 60;
 
-/// Usage:
+/// Usage (settings from `sound2view.toml`, see `config.rs`):
 /// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
 /// - `sound2view mic`: capture from the UMA-16
 /// - `sound2view probe`: list audio input devices
@@ -43,15 +43,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     match arg.as_str() {
         "probe" => capture::probe(),
         "camprobe" => video::probe(),
-        "camshot" => camshot(),
-        "gui" => run_gui(),
-        "mic" => run_mic(),
-        path => run_sim(path),
+        "camshot" => camshot(&Config::load(CONFIG_PATH)?),
+        "gui" => run_gui(Config::load(CONFIG_PATH)?),
+        "mic" => run_mic(&Config::load(CONFIG_PATH)?),
+        path => run_sim(path, &Config::load(CONFIG_PATH)?),
     }
 }
 
-fn camshot() -> Result<(), Box<dyn Error>> {
-    let mut camera = CameraSource::new(CAMERA_INDEX)?;
+fn camshot(config: &Config) -> Result<(), Box<dyn Error>> {
+    let c = &config.camera;
+    let mut camera = CameraSource::open_by_name(&c.name, c.width, c.height, c.fps)?;
 
     // The first frame includes stream startup, so it is not timed
     let mut frame = camera.next_frame().ok_or("no frame from camera")?;
@@ -75,42 +76,61 @@ fn camshot() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_sim(path: &str) -> Result<(), Box<dyn Error>> {
+fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     println!("Reading scene from {path}");
     let scene = Scene::from_toml(&fs::read_to_string(path)?)?;
     scene.validate();
 
     let src_pos = scene.sources.iter().map(|s| s.pos).collect();
-    let pipeline = Pipeline::new(scene.sample_rate, make_das);
+    let sample_rate = scene.sample_rate;
     let mut sim = Simulator::new(scene, MicArray::uma16());
 
     // `?` does not convert `+ Send + Sync` away, the cast does
-    run(&mut sim, pipeline, save_maps(src_pos, None)).map_err(|e| e as Box<dyn Error>)?;
+    run_configured(&mut sim, sample_rate, config, save_maps(src_pos, None))
+        .map_err(|e| e as Box<dyn Error>)?;
     Ok(())
 }
 
-fn run_mic() -> Result<(), Box<dyn Error>> {
-    println!("Capturing from {MIC_DEVICE} at {MIC_SAMPLE_RATE} Hz");
-    let mut mic = CpalSource::<16>::new(MIC_DEVICE, MIC_SAMPLE_RATE)?;
+fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
+    let audio = &config.audio;
+    println!("Capturing from {} at {} Hz", audio.device, audio.sample_rate);
+    let mut mic = CpalSource::<16>::new(&audio.device, audio.sample_rate)?;
 
-    let pipeline = Pipeline::new(MIC_SAMPLE_RATE as f64, make_das);
-    run(&mut mic, pipeline, save_maps(Vec::new(), Some(MIC_MAPS)))
+    let sample_rate = audio.sample_rate as f64;
+    run_configured(&mut mic, sample_rate, config, save_maps(Vec::new(), Some(MIC_MAPS)))
         .map_err(|e| e as Box<dyn Error>)?;
 
     println!("dropped {} chunks", mic.dropped());
     Ok(())
 }
 
-/// DAS with diagonal removal and true-location normalization
-fn make_das(steering: Steering<16>) -> Das<16> {
-    Das::new(steering, true, Normalization::TrueLocation)
-}
+/// Run `source` through a pipeline with the configured beamformer and camera.
+///
+/// One `run` instantiation per method (static dispatch); the `match` picks it at runtime.
+fn run_configured<S: FrameSource<16>>(
+    source: &mut S,
+    sample_rate: f64,
+    config: &Config,
+    on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
+) -> Result<(), BoxError> {
+    let camera = config.camera.camera();
+    let pipeline = &config.pipeline;
 
-/// Exponent nu of functional beamforming; larger is sharper but more sensitive to model errors
-const FUNCTIONAL_NU: f64 = 20.0;
-
-fn make_functional(steering: Steering<16>) -> Functional<16> {
-    Functional::new(steering, FUNCTIONAL_NU)
+    match config.beamformer.method {
+        Method::Das => {
+            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+                Das::new(steering, true, Normalization::TrueLocation)
+            });
+            run(source, pipeline, on_map)
+        }
+        Method::Functional => {
+            let nu = config.beamformer.nu;
+            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+                Functional::new(steering, nu)
+            });
+            run(source, pipeline, on_map)
+        }
+    }
 }
 
 /// Map handler for `run`: writes each map as `map_NNN.png` with a marker per `src_pos`.
@@ -119,7 +139,7 @@ fn make_functional(steering: Steering<16>) -> Functional<16> {
 fn save_maps(
     src_pos: Vec<Point3>,
     max_maps: Option<usize>,
-) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, Box<dyn Error + Send + Sync>> {
+) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError> {
     let mut i = 0;
     move |power, layout| {
         render::map_image(power, layout, &src_pos).save(format!("map_{i:03}.png"))?;
@@ -132,14 +152,14 @@ fn save_maps(
     }
 }
 
-fn run_gui() -> Result<(), Box<dyn Error>> {
+fn run_gui(config: Config) -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "sound2view",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default().with_maximized(true),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(gui::App::new(cc, CAMERA_INDEX)))),
+        Box::new(|cc| Ok(Box::new(gui::App::new(cc, config)))),
     )?;
     Ok(())
 }

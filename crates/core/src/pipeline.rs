@@ -6,6 +6,8 @@ use std::{
     time::Instant,
 };
 
+use serde::Deserialize;
+
 use crate::{
     FrameSource,
     dsp::{
@@ -13,28 +15,42 @@ use crate::{
         covariance::SlidingCovariance,
         stft::{Stft, StftStream},
     },
-    geometry::{
-        camera::{Camera, Intrinsics, Mount},
-        mic_array::MicArray,
-        scan_grid::ScanGrid,
-    },
+    geometry::{camera::Camera, mic_array::MicArray, scan_grid::ScanGrid},
 };
 
-/// STFT length N, hop is N/2
-const FFT_LEN: usize = 1024;
-/// Memory of the sliding covariance in STFT frames (about 0.43 s at 48 kHz)
-const L_FRAMES: usize = 40;
-/// One map every this many STFT frames (about 0.11 s at 48 kHz); `power_map` must take less
-const MAP_EVERY: usize = 10;
-/// Band summed in the power map, in Hz
-const F_LO_HZ: f64 = 900.0;
-const F_HI_HZ: f64 = 4100.0;
-/// Scan grid width in grid pixels
-const GRID_WIDTH: u32 = 64;
-/// Focus distance of the scan grid in meters
-const GRID_Z: f64 = 2.0;
-/// Camera horizontal field of view in degrees
-const HFOV_DEG: f64 = 83.0;
+/// Processing parameters, e.g. from a config file; the defaults are tested with the UMA-16 at 48 kHz
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineConfig {
+    /// STFT length N, hop is N/2
+    pub fft_len: usize,
+    /// Memory of the sliding covariance in STFT frames (40: about 0.43 s at 48 kHz)
+    pub memory_frames: usize,
+    /// One map every this many STFT frames (10: about 0.11 s at 48 kHz); `power_map` must take less
+    pub map_every: usize,
+    /// Lower end of the band summed in the power map, in Hz
+    pub f_lo_hz: f64,
+    /// Upper end of the band, in Hz
+    pub f_hi_hz: f64,
+    /// Scan grid width in grid pixels; the height follows from the camera aspect ratio
+    pub grid_width: u32,
+    /// Focus distance of the scan grid in meters
+    pub grid_z: f64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            fft_len: 1024,
+            memory_frames: 40,
+            map_every: 10,
+            f_lo_hz: 900.0,
+            f_hi_hz: 4100.0,
+            grid_width: 64,
+            grid_z: 2.0,
+        }
+    }
+}
 
 /// Everything after the `FrameSource`: STFT, covariance, beamformer and output
 pub struct Pipeline<const M: usize, B: Beamformer<M>> {
@@ -43,6 +59,8 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     beamformer: B,
     /// Bins summed in the power map
     bins: RangeInclusive<usize>,
+    /// One map every this many STFT frames
+    map_every: usize,
     /// Layout of the power map
     layout: MapLayout,
 }
@@ -55,35 +73,50 @@ pub struct MapLayout {
 }
 
 impl<B: Beamformer<16>> Pipeline<16, B> {
-    /// UMA-16 pipeline for `sample_rate` in Hz; `src_pos` are the true sources for the markers.
+    /// UMA-16 pipeline for `sample_rate` in Hz; the scan grid covers the field of view of `camera`.
     ///
     /// `make_beamformer` builds the beamformer from the steering of this pipeline's scan grid.
-    pub fn new(sample_rate: f64, make_beamformer: impl FnOnce(Steering<16>) -> B) -> Self {
-        let camera = Camera {
-            intrinsics: Intrinsics::from_hfov(1920, 1080, HFOV_DEG.to_radians()),
-            mount: Mount::default(),
-        };
-        let scan_grid = ScanGrid::new(&camera, GRID_WIDTH, GRID_Z);
+    pub fn new(
+        sample_rate: f64,
+        config: &PipelineConfig,
+        camera: Camera,
+        make_beamformer: impl FnOnce(Steering<16>) -> B,
+    ) -> Self {
+        // TODO(Julian): config errors as `Result` with the thiserror plan
+        assert!(
+            config.f_lo_hz < config.f_hi_hz,
+            "band: f_lo_hz must be below f_hi_hz"
+        );
+        assert!(config.map_every > 0, "map_every must be at least 1");
 
-        let df = sample_rate / FFT_LEN as f64;
-        let bins = (F_LO_HZ / df).round() as usize..=(F_HI_HZ / df).round() as usize;
+        let scan_grid = ScanGrid::new(&camera, config.grid_width, config.grid_z);
+
+        let n_bins = config.fft_len / 2 + 1;
+        let df = sample_rate / config.fft_len as f64;
+        // The upper end is clipped to the last bin (f_s/2)
+        let bin_lo = (config.f_lo_hz / df).round() as usize;
+        let bin_hi = ((config.f_hi_hz / df).round() as usize).min(n_bins - 1);
+        let bins = bin_lo..=bin_hi;
 
         println!(
-            "Grid {}x{}, bins {bins:?}, L = {L_FRAMES}, map every {MAP_EVERY} frames",
+            "Grid {}x{}, bins {bins:?}, memory {} frames, map every {} frames",
             scan_grid.width(),
-            scan_grid.height()
+            scan_grid.height(),
+            config.memory_frames,
+            config.map_every
         );
 
         Self {
-            stream: StftStream::new(Stft::new(FFT_LEN)),
-            cov: SlidingCovariance::new(FFT_LEN / 2 + 1, L_FRAMES),
+            stream: StftStream::new(Stft::new(config.fft_len)),
+            cov: SlidingCovariance::new(n_bins, config.memory_frames),
             beamformer: make_beamformer(Steering::new(
                 &scan_grid,
                 &MicArray::uma16(),
                 sample_rate,
-                FFT_LEN,
+                config.fft_len,
             )),
             bins,
+            map_every: config.map_every,
             layout: MapLayout {
                 camera,
                 grid_width: scan_grid.width(),
@@ -93,9 +126,10 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
     }
 }
 
-/// Read `source` through the pipeline; one power map every `MAP_EVERY` STFT frames.
+/// Read `source` through the pipeline; one power map every `map_every` STFT frames.
 ///
-/// The covariance is a sliding average over about `L_FRAMES` frames, so consecutive maps overlap.
+/// The covariance is a sliding average over about `memory_frames` frames, so consecutive maps
+/// overlap.
 /// Each map is passed to `on_map` together with its [`MapLayout`]. Stops when the source ends
 /// (`Ok(0)`), when `on_map` returns `Break`, or on the first error from `source` or `on_map`.
 pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
@@ -123,7 +157,7 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             new_frames += 1;
         });
 
-        if new_frames >= MAP_EVERY {
+        if new_frames >= pipeline.map_every {
             let start = Instant::now();
             pipeline
                 .beamformer

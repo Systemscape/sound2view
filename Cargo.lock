@@ -3819,7 +3819,9 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "image",
+ "serde",
  "sound2view-core",
+ "toml",
 ]
 
 [[package]]

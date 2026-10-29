@@ -1,0 +1,42 @@
+# sound2view settings. Every entry is optional; the values below are the defaults.
+# Unknown entries are an error, so typos do not go unnoticed.
+
+[audio]
+# Input device id pattern, see `sound2view probe`
+device = "hw:CARD=UMA16v2"
+sample_rate = 48000
+
+[camera]
+# Part of the camera name (case-insensitive), see `sound2view camprobe`
+name = "icspring"
+# MJPEG capture format, must be listed by `sound2view camprobe`
+width = 1920
+height = 1080
+fps = 60
+# Horizontal field of view at this resolution, measured on a wall
+hfov_deg = 83.0
+
+[pipeline]
+# STFT length, hop is half of it
+fft_len = 1024
+# Memory of the sliding covariance in STFT frames (40: about 0.43 s at 48 kHz)
+memory_frames = 40
+# One map every this many STFT frames (10: about 0.11 s at 48 kHz)
+map_every = 10
+# Band summed in the map, in Hz (adjustable in the GUI)
+f_lo_hz = 900.0
+f_hi_hz = 4100.0
+# Scan grid width in grid pixels; the height follows from the camera aspect ratio
+grid_width = 64
+# Focus distance in meters
+grid_z = 2.0
+
+[beamformer]
+# "das" or "functional" (selectable in the GUI)
+method = "functional"
+# Exponent of functional beamforming: larger is sharper, more sensitive to model errors
+nu = 20.0
+
+[display]
+# Overlay range in dB below the map maximum (adjustable in the GUI)
+db_range = 3.0

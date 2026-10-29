@@ -6,7 +6,10 @@ use nokhwa::{
     Camera,
     pixel_format::RgbAFormat,
     query,
-    utils::{ApiBackend, CameraFormat, RequestedFormat, RequestedFormatType, Resolution},
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
+        Resolution,
+    },
 };
 
 use crate::{ImageSource, VideoFrame};
@@ -50,21 +53,49 @@ pub struct CameraSource {
 }
 
 impl CameraSource {
-    /// Open camera `index` (see [`probe`]) and start streaming.
-    pub fn new(index: u32) -> Result<Self, Box<dyn Error>> {
+    /// Open camera `index` (see [`probe`]) with MJPEG at `width` x `height` and `fps`, and start
+    /// streaming.
+    pub fn new(index: u32, width: u32, height: u32, fps: u32) -> Result<Self, Box<dyn Error>> {
         let format = RequestedFormatType::Exact(CameraFormat::new(
-            Resolution::new(1920, 1080),
-            nokhwa::utils::FrameFormat::MJPEG,
-            60,
+            Resolution::new(width, height),
+            FrameFormat::MJPEG,
+            fps,
         ));
 
         let mut camera = Camera::new(
-            nokhwa::utils::CameraIndex::Index(index),
+            CameraIndex::Index(index),
             RequestedFormat::new::<RgbAFormat>(format),
         )?;
         camera.open_stream()?;
 
         Ok(Self { camera })
+    }
+
+    /// Open the first camera whose name contains `name` (case-insensitive) and that streams the
+    /// requested format, see [`Self::new`].
+    ///
+    /// One camera can show up as several devices (e.g. a V4L2 metadata node that cannot
+    /// stream), so all matches are tried in order. Unlike the index, the name survives replugging.
+    pub fn open_by_name(
+        name: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let name = name.to_lowercase();
+        let mut last_error = None;
+
+        for info in query(ApiBackend::Auto)? {
+            if !info.human_name().to_lowercase().contains(&name) {
+                continue;
+            }
+            match Self::new(info.index().as_index()?, width, height, fps) {
+                Ok(camera) => return Ok(camera),
+                Err(e) => last_error = Some(e),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| format!("no camera with {name:?} in its name").into()))
     }
 }
 

@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     ops::ControlFlow,
     sync::{
         Arc, Mutex,
@@ -10,38 +9,21 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, Rect, RichText, TextureHandle,
-    TextureOptions, pos2,
+    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, Rect, RichText, Slider,
+    TextureHandle, TextureOptions, pos2,
 };
 use sound2view_core::{
     ImageSource, VideoFrame,
-    pipeline::{MapLayout, Pipeline, run},
+    pipeline::{MapLayout, PipelineConfig},
     render,
     source::{capture::CpalSource, video::CameraSource},
 };
 
-use crate::{MIC_DEVICE, MIC_SAMPLE_RATE, make_das, make_functional, theme};
-
-/// Overlay range in dB below the map maximum; lower values are transparent
-const OVERLAY_DB_RANGE: f64 = 3.0;
-
-/// Beamforming method, selectable in the GUI
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Method {
-    Das,
-    Functional,
-}
-
-impl Method {
-    const ALL: [Method; 2] = [Method::Das, Method::Functional];
-
-    fn label(self) -> &'static str {
-        match self {
-            Method::Das => "Delay and sum",
-            Method::Functional => "Functional",
-        }
-    }
-}
+use crate::{
+    BoxError,
+    config::{BeamformerConfig, CameraConfig, Config, Method},
+    run_configured, theme,
+};
 
 /// Camera state, set by the camera thread and shown in the GUI
 #[derive(Clone, Debug, PartialEq)]
@@ -94,23 +76,42 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
 /// Font size of the camera status text on the image
 const STATUS_FONT_SIZE: f32 = 28.0;
 
-/// Power map as RGBA at grid resolution, ready for a texture
-struct MapImage {
+/// Slider limits
+const NU_RANGE: std::ops::RangeInclusive<f64> = 1.0..=100.0;
+const DB_RANGE_RANGE: std::ops::RangeInclusive<f64> = 1.0..=20.0;
+/// Band limits in Hz; above about 6 kHz grating lobes appear in the image
+const F_MIN_HZ: f64 = 100.0;
+const F_MAX_HZ: f64 = 6000.0;
+/// Smallest band width in Hz
+const MIN_BAND_HZ: f64 = 100.0;
+
+/// Settings whose change restarts the pipeline in the audio thread
+#[derive(Clone, Debug, PartialEq)]
+struct PipelineSettings {
+    beamformer: BeamformerConfig,
+    pipeline: PipelineConfig,
+}
+
+/// Power map from the audio thread, row-major like the scan grid
+struct MapData {
     /// [width, height] in grid pixels
     size: [usize; 2],
-    /// Unmultiplied RGBA, row-major
-    rgba: Vec<u8>,
+    power: Vec<f64>,
 }
 
 pub struct App {
     rx: Receiver<VideoFrame>,
     texture: Option<TextureHandle>,
-    map_rx: Receiver<MapImage>,
+    map_rx: Receiver<MapData>,
     map_texture: Option<TextureHandle>,
-    /// Method shown in the GUI
-    method: Method,
-    /// Method read by the audio thread, which restarts the pipeline when it changes
-    shared_method: Arc<Mutex<Method>>,
+    /// Kept to redraw the overlay when the dB range changes between maps
+    last_map: Option<MapData>,
+    /// Overlay range in dB below the map maximum; applies immediately
+    db_range: f64,
+    /// Settings edited in the GUI
+    settings: PipelineSettings,
+    /// Settings read by the audio thread; updated from `settings` when no slider is dragged
+    shared_settings: Arc<Mutex<PipelineSettings>>,
     /// Written by the camera thread
     camera_status: Arc<Mutex<CameraStatus>>,
 }
@@ -130,20 +131,14 @@ impl eframe::App for App {
             }
         }
 
+        let mut redraw_map = false;
         if let Some(map) = self.map_rx.try_iter().last() {
-            let image = ColorImage::from_rgba_unmultiplied(map.size, &map.rgba);
-            // Linear filtering interpolates the coarse grid smoothly to the image size
-            if let Some(texture) = &mut self.map_texture {
-                texture.set(image, TextureOptions::LINEAR);
-            } else {
-                self.map_texture =
-                    Some(ui.ctx().load_texture("map", image, TextureOptions::LINEAR));
-            }
+            self.last_map = Some(map);
+            redraw_map = true;
         }
 
         let status = self.camera_status.lock().unwrap().clone();
 
-        let previous = self.method;
         let top_frame = egui::Frame::new()
             .fill(theme::PANEL)
             .inner_margin(Margin::symmetric(16, 10));
@@ -151,14 +146,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("sound2view").strong().size(18.0));
                 ui.add_space(24.0);
-                ui.label(RichText::new("Beamformer").color(theme::TEXT_WEAK));
-                egui::ComboBox::from_id_salt("method")
-                    .selected_text(self.method.label())
-                    .show_ui(ui, |ui| {
-                        for method in Method::ALL {
-                            ui.selectable_value(&mut self.method, method, method.label());
-                        }
-                    });
+                redraw_map |= self.controls(ui);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(status.short()).color(theme::TEXT_WEAK));
@@ -166,8 +154,27 @@ impl eframe::App for App {
                 });
             });
         });
-        if self.method != previous {
-            *self.shared_method.lock().unwrap() = self.method;
+
+        // Apply pipeline settings only when no slider is dragged: each change restarts the
+        // pipeline, and the sliding covariance needs a few frames for the first map
+        let pointer_down = ui.input(|i| i.pointer.any_down());
+        if !pointer_down {
+            let mut shared = self.shared_settings.lock().unwrap();
+            if *shared != self.settings {
+                *shared = self.settings.clone();
+            }
+        }
+
+        if redraw_map && let Some(map) = &self.last_map {
+            let rgba = render::map_rgba(&map.power, self.db_range);
+            let image = ColorImage::from_rgba_unmultiplied(map.size, &rgba);
+            // Linear filtering interpolates the coarse grid smoothly to the image size
+            if let Some(texture) = &mut self.map_texture {
+                texture.set(image, TextureOptions::LINEAR);
+            } else {
+                self.map_texture =
+                    Some(ui.ctx().load_texture("map", image, TextureOptions::LINEAR));
+            }
         }
 
         let central_frame = egui::Frame::new()
@@ -207,26 +214,93 @@ impl eframe::App for App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, camera_idx: u32) -> Self {
+    pub fn new(cc: &eframe::CreationContext, config: Config) -> Self {
         theme::apply(&cc.egui_ctx);
 
-        let method = Method::Functional;
-        let shared_method = Arc::new(Mutex::new(method));
+        let settings = PipelineSettings {
+            beamformer: config.beamformer.clone(),
+            pipeline: config.pipeline.clone(),
+        };
+        let shared_settings = Arc::new(Mutex::new(settings.clone()));
         let camera_status = Arc::new(Mutex::new(CameraStatus::Opening));
+
         Self {
             rx: spawn_camera(
                 cc.egui_ctx.clone(),
-                camera_idx,
+                config.camera.clone(),
                 Arc::clone(&camera_status),
             ),
             texture: None,
-            map_rx: spawn_audio(cc.egui_ctx.clone(), Arc::clone(&shared_method)),
+            map_rx: spawn_audio(
+                cc.egui_ctx.clone(),
+                config.clone(),
+                Arc::clone(&shared_settings),
+            ),
             map_texture: None,
-            method,
-            shared_method,
+            last_map: None,
+            db_range: config.display.db_range,
+            settings,
+            shared_settings,
             camera_status,
         }
     }
+
+    /// Beamformer, nu, band and overlay range; returns true if the overlay needs a redraw
+    fn controls(&mut self, ui: &mut egui::Ui) -> bool {
+        let beamformer = &mut self.settings.beamformer;
+        let pipeline = &mut self.settings.pipeline;
+
+        label(ui, "Beamformer");
+        egui::ComboBox::from_id_salt("method")
+            .selected_text(beamformer.method.label())
+            .show_ui(ui, |ui| {
+                for method in Method::ALL {
+                    ui.selectable_value(&mut beamformer.method, method, method.label());
+                }
+            });
+
+        ui.add_space(16.0);
+        label(ui, "nu");
+        let is_functional = beamformer.method == Method::Functional;
+        ui.add_enabled(
+            is_functional,
+            Slider::new(&mut beamformer.nu, NU_RANGE)
+                .logarithmic(true)
+                .max_decimals(0),
+        )
+        .on_hover_text("Exponent of functional beamforming: larger is sharper");
+
+        ui.add_space(16.0);
+        label(ui, "Band");
+        // Each end is limited by the other, so the band never collapses
+        ui.add(
+            Slider::new(&mut pipeline.f_lo_hz, F_MIN_HZ..=pipeline.f_hi_hz - MIN_BAND_HZ)
+                .logarithmic(true)
+                .suffix(" Hz")
+                .max_decimals(0),
+        );
+        ui.add(
+            Slider::new(&mut pipeline.f_hi_hz, pipeline.f_lo_hz + MIN_BAND_HZ..=F_MAX_HZ)
+                .logarithmic(true)
+                .suffix(" Hz")
+                .max_decimals(0),
+        );
+
+        ui.add_space(16.0);
+        label(ui, "Overlay");
+        ui.add(
+            Slider::new(&mut self.db_range, DB_RANGE_RANGE)
+                .suffix(" dB")
+                .max_decimals(1),
+        )
+        .on_hover_text("Range below the map maximum that is shown")
+        .changed()
+    }
+}
+
+/// Muted label in front of a control
+fn label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).color(theme::TEXT_WEAK));
 }
 
 /// Wait between attempts to open the camera
@@ -241,7 +315,7 @@ const CAMERA_MAX_FAILED_FRAMES: usize = 10;
 /// state to `status`.
 fn spawn_camera(
     ctx: egui::Context,
-    camera_idx: u32,
+    config: CameraConfig,
     status: Arc<Mutex<CameraStatus>>,
 ) -> Receiver<VideoFrame> {
     let (tx, rx) = sync_channel(1);
@@ -253,7 +327,9 @@ fn spawn_camera(
         };
 
         loop {
-            let mut camera = match CameraSource::new(camera_idx) {
+            let camera =
+                CameraSource::open_by_name(&config.name, config.width, config.height, config.fps);
+            let mut camera = match camera {
                 Ok(camera) => {
                     set_status(CameraStatus::Streaming);
                     camera
@@ -285,34 +361,39 @@ fn spawn_camera(
     rx
 }
 
-/// Audio thread: UMA-16 capture and pipeline, sends each map as RGBA overlay.
+/// Audio thread: UMA-16 capture and pipeline, sends each power map to the GUI.
 ///
-/// The mic stays open; when `method` changes, `run` stops after the next map and restarts with a
-/// new pipeline of the other beamformer type. Source and pipeline are created inside the thread
-/// (`cpal::Stream` is not `Send` everywhere).
-fn spawn_audio(ctx: egui::Context, method: Arc<Mutex<Method>>) -> Receiver<MapImage> {
+/// The mic stays open; when `settings` change, `run` stops after the next map and restarts with
+/// a new pipeline (possibly of another beamformer type). Source and pipeline are created inside
+/// the thread (`cpal::Stream` is not `Send` everywhere).
+fn spawn_audio(
+    ctx: egui::Context,
+    mut config: Config,
+    settings: Arc<Mutex<PipelineSettings>>,
+) -> Receiver<MapData> {
     let (tx, rx) = sync_channel(1);
 
     thread::spawn(move || {
-        let mut mic = match CpalSource::<16>::new(MIC_DEVICE, MIC_SAMPLE_RATE) {
+        let audio = &config.audio;
+        let mut mic = match CpalSource::<16>::new(&audio.device, audio.sample_rate) {
             Ok(mic) => mic,
             Err(e) => {
                 eprintln!("audio capture: {e}");
                 return;
             }
         };
-        let sample_rate = MIC_SAMPLE_RATE as f64;
+        let sample_rate = audio.sample_rate as f64;
 
         loop {
-            let current = *method.lock().unwrap();
+            let current = settings.lock().unwrap().clone();
+            config.beamformer = current.beamformer.clone();
+            config.pipeline = current.pipeline.clone();
             let mut gui_closed = false;
 
-            let on_map = |power: &[f64],
-                          layout: &MapLayout|
-             -> Result<ControlFlow<()>, Box<dyn Error + Send + Sync>> {
-                let map = MapImage {
+            let on_map = |power: &[f64], layout: &MapLayout| -> Result<ControlFlow<()>, BoxError> {
+                let map = MapData {
                     size: [layout.grid_width, layout.grid_height],
-                    rgba: render::map_rgba(power, OVERLAY_DB_RANGE),
+                    power: power.to_vec(),
                 };
                 match tx.try_send(map) {
                     Ok(()) => ctx.request_repaint(),
@@ -322,26 +403,20 @@ fn spawn_audio(ctx: egui::Context, method: Arc<Mutex<Method>>) -> Receiver<MapIm
                         return Ok(ControlFlow::Break(()));
                     }
                 }
-                if *method.lock().unwrap() != current {
+                if *settings.lock().unwrap() != current {
                     return Ok(ControlFlow::Break(()));
                 }
                 Ok(ControlFlow::Continue(()))
             };
 
-            // One arm per beamformer type: static dispatch, no `dyn`
-            let result = match current {
-                Method::Das => run(&mut mic, Pipeline::new(sample_rate, make_das), on_map),
-                Method::Functional => {
-                    run(&mut mic, Pipeline::new(sample_rate, make_functional), on_map)
-                }
-            };
+            let result = run_configured(&mut mic, sample_rate, &config, on_map);
 
             if let Err(e) = result {
                 eprintln!("audio pipeline: {e}");
                 break;
             }
-            // Restart only on a method change; GUI closed or end of stream stops the thread
-            if gui_closed || *method.lock().unwrap() == current {
+            // Restart only on a settings change; GUI closed or end of stream stops the thread
+            if gui_closed || *settings.lock().unwrap() == current {
                 break;
             }
         }
