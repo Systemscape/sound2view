@@ -10,7 +10,8 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, FontId, Rect, TextureHandle, TextureOptions, pos2,
+    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, Rect, RichText, TextureHandle,
+    TextureOptions, pos2,
 };
 use sound2view_core::{
     ImageSource, VideoFrame,
@@ -19,7 +20,7 @@ use sound2view_core::{
     source::{capture::CpalSource, video::CameraSource},
 };
 
-use crate::{MIC_DEVICE, MIC_SAMPLE_RATE, make_das, make_functional};
+use crate::{MIC_DEVICE, MIC_SAMPLE_RATE, make_das, make_functional, theme};
 
 /// Overlay range in dB below the map maximum; lower values are transparent
 const OVERLAY_DB_RANGE: f64 = 3.0;
@@ -64,6 +65,30 @@ impl CameraStatus {
             CameraStatus::Lost => "Camera lost, reopening".to_string(),
         }
     }
+
+    /// One or two words for the top bar
+    fn short(&self) -> &'static str {
+        match self {
+            CameraStatus::Opening => "Camera opening",
+            CameraStatus::Missing(_) => "Camera not found",
+            CameraStatus::Streaming => "Camera live",
+            CameraStatus::Lost => "Camera lost",
+        }
+    }
+
+    fn color(&self) -> Color32 {
+        match self {
+            CameraStatus::Streaming => theme::OK,
+            CameraStatus::Opening | CameraStatus::Missing(_) => theme::ACCENT,
+            CameraStatus::Lost => theme::ERROR,
+        }
+    }
+}
+
+/// Small filled circle, vertically centered in the current row
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 /// Font size of the camera status text on the image
@@ -116,22 +141,39 @@ impl eframe::App for App {
             }
         }
 
+        let status = self.camera_status.lock().unwrap().clone();
+
         let previous = self.method;
-        egui::Panel::top("controls").show(ui, |ui| {
-            egui::ComboBox::from_label("Beamformer")
-                .selected_text(self.method.label())
-                .show_ui(ui, |ui| {
-                    for method in Method::ALL {
-                        ui.selectable_value(&mut self.method, method, method.label());
-                    }
+        let top_frame = egui::Frame::new()
+            .fill(theme::PANEL)
+            .inner_margin(Margin::symmetric(16, 10));
+        egui::Panel::top("controls").frame(top_frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("sound2view").strong().size(18.0));
+                ui.add_space(24.0);
+                ui.label(RichText::new("Beamformer").color(theme::TEXT_WEAK));
+                egui::ComboBox::from_id_salt("method")
+                    .selected_text(self.method.label())
+                    .show_ui(ui, |ui| {
+                        for method in Method::ALL {
+                            ui.selectable_value(&mut self.method, method, method.label());
+                        }
+                    });
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(status.short()).color(theme::TEXT_WEAK));
+                    status_dot(ui, status.color());
                 });
+            });
         });
         if self.method != previous {
             *self.shared_method.lock().unwrap() = self.method;
         }
 
-        let status = self.camera_status.lock().unwrap().clone();
-        egui::CentralPanel::default().show(ui, |ui| {
+        let central_frame = egui::Frame::new()
+            .fill(theme::BACKGROUND)
+            .inner_margin(Margin::same(12));
+        egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             let available = ui.available_rect_before_wrap();
             let painter = ui.painter();
             let font = FontId::proportional(STATUS_FONT_SIZE);
@@ -166,6 +208,8 @@ impl eframe::App for App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, camera_idx: u32) -> Self {
+        theme::apply(&cc.egui_ctx);
+
         let method = Method::Functional;
         let shared_method = Arc::new(Mutex::new(method));
         let camera_status = Arc::new(Mutex::new(CameraStatus::Opening));

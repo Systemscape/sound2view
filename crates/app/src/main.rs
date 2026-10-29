@@ -15,6 +15,7 @@ use sound2view_core::{
 };
 
 mod gui;
+mod theme;
 
 /// Input device id pattern of the UMA-16, see `sound2view probe`
 const MIC_DEVICE: &str = "hw:CARD=UMA16v2";
