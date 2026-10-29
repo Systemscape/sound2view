@@ -134,7 +134,10 @@ fn save_maps(
 fn run_gui() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "sound2view",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default().with_maximized(true),
+            ..Default::default()
+        },
         Box::new(|cc| Ok(Box::new(gui::App::new(cc, CAMERA_INDEX)))),
     )?;
     Ok(())
