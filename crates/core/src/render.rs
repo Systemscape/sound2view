@@ -52,6 +52,28 @@ pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbIm
     big
 }
 
+/// Largest overlay alpha, at 0 dB; the camera image stays visible underneath
+const OVERLAY_ALPHA_MAX: f64 = 200.0;
+
+/// Power map as RGBA overlay at grid resolution, row-major like the scan grid, unmultiplied alpha.
+///
+/// Normalized to the map maximum. Fully transparent at `db_range` dB below the maximum and lower;
+/// from there yellow to red and increasingly opaque up to 0 dB.
+pub fn map_rgba(power: &[f64], db_range: f64) -> Vec<u8> {
+    let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    power
+        .iter()
+        .flat_map(|&p| {
+            let db = 10.0 * (p / p_max).max(1e-10).log10();
+            // -db_range dB -> 0, 0 dB -> 1
+            let t = ((db + db_range) / db_range).clamp(0.0, 1.0);
+            let green = (255.0 * (1.0 - t)) as u8;
+            let alpha = (OVERLAY_ALPHA_MAX * t) as u8;
+            [255, green, 0, alpha]
+        })
+        .collect()
+}
+
 /// Map power to gray: 0 dB (the maximum) is white, -15 dB and below is black.
 fn power_to_rgb(p: f64, p_max: f64) -> Rgb<u8> {
     let db = 10.0 * (p / p_max).max(1e-10).log10();

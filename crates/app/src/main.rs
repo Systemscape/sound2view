@@ -3,7 +3,7 @@ use std::{env, error::Error, fs, ops::ControlFlow, time::Instant};
 use image::RgbaImage;
 use sound2view_core::{
     ImageSource, Point3,
-    dsp::beamformer::{Normalization, Steering, delay_and_sum::Das},
+    dsp::beamformer::{Normalization, Steering, delay_and_sum::Das, functional::Functional},
     geometry::mic_array::MicArray,
     pipeline::{MapLayout, Pipeline, run},
     render,
@@ -103,6 +103,13 @@ fn run_mic() -> Result<(), Box<dyn Error>> {
 /// DAS with diagonal removal and true-location normalization
 fn make_das(steering: Steering<16>) -> Das<16> {
     Das::new(steering, true, Normalization::TrueLocation)
+}
+
+/// Exponent nu of functional beamforming; larger is sharper but more sensitive to model errors
+const FUNCTIONAL_NU: f64 = 20.0;
+
+fn make_functional(steering: Steering<16>) -> Functional<16> {
+    Functional::new(steering, FUNCTIONAL_NU)
 }
 
 /// Map handler for `run`: writes each map as `map_NNN.png` with a marker per `src_pos`.

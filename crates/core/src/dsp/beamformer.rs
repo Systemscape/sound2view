@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub mod delay_and_sum;
+pub mod functional;
 
 pub struct Steering<const M: usize> {
     /// Precomputed distances per grid point
