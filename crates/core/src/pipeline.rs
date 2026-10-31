@@ -11,11 +11,14 @@ use serde::Deserialize;
 use crate::{
     BoxError, FrameSource,
     dsp::{
+        beam_signal::{BeamSignal, TRACK_SAMPLE_RATE, decimation_factor},
         beamformer::{Beamformer, Steering},
         covariance::SlidingCovariance,
         stft::{Stft, StftStream},
     },
     geometry::{camera::Camera, mic_array::MicArray, scan_grid::ScanGrid},
+    peaks::{PeakConfig, find_peaks},
+    tracking::{Track, Tracker, TrackerConfig},
 };
 
 /// Processing parameters, e.g. from a config file; the defaults are tested with the UMA-16 at 48 kHz
@@ -86,7 +89,7 @@ impl PipelineConfig {
     }
 }
 
-/// Everything after the `FrameSource`: STFT, covariance, beamformer and output
+/// Everything after the `FrameSource`: STFT, covariance, beamformer, peaks, tracks and output
 pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     stream: StftStream<M>,
     cov: SlidingCovariance<M>,
@@ -97,6 +100,31 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     map_every: usize,
     /// Layout of the power map
     layout: MapLayout,
+    peaks: PeakConfig,
+    tracker: Tracker,
+    /// Audio toward each track, by track id; empty if the sample rate has no integer
+    /// decimation factor to `TRACK_SAMPLE_RATE`
+    beams: Vec<(u64, BeamSignal<M>)>,
+    track_audio: Option<TrackAudio<M>>,
+}
+
+/// What a new track needs to get its beam signal: grid cell -> point -> mic distances
+struct TrackAudio<const M: usize> {
+    mic_array: MicArray<M>,
+    /// Camera at scan grid resolution, see [`ScanGrid::new`]
+    grid_camera: Camera,
+    grid_z: f64,
+    fft_len: usize,
+    stft_scale: f64,
+    sample_rate: f64,
+}
+
+impl<const M: usize> TrackAudio<M> {
+    /// Mic distances to the point of grid cell (col, row) at the focus distance
+    fn distances(&self, track: &Track) -> [f64; M] {
+        let point = self.grid_camera.unproject(track.col, track.row, self.grid_z);
+        self.mic_array.get_distance_from(&point)
+    }
 }
 
 #[derive(Clone)]
@@ -110,15 +138,20 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
     /// UMA-16 pipeline for `sample_rate` in Hz; the scan grid covers the field of view of `camera`.
     ///
     /// `make_beamformer` builds the beamformer from the steering of this pipeline's scan grid.
+    /// Each map's peaks (`peaks`) are followed as tracks (`tracking`), each with the audio from
+    /// its direction if `sample_rate` is an integer multiple of [`TRACK_SAMPLE_RATE`].
     ///
-    /// Error if `config` is invalid, see [`PipelineConfig::validate`].
+    /// Error if `config` or `tracking` is invalid, see [`PipelineConfig::validate`].
     pub fn new(
         sample_rate: f64,
         config: &PipelineConfig,
+        peaks: &PeakConfig,
+        tracking: &TrackerConfig,
         camera: Camera,
         make_beamformer: impl FnOnce(Steering<16>) -> B,
     ) -> Result<Self, PipelineError> {
         config.validate(sample_rate)?;
+        tracking.validate().map_err(PipelineError::InvalidConfig)?;
 
         let scan_grid = ScanGrid::new(&camera, config.grid_width, config.grid_z);
 
@@ -137,8 +170,29 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
             config.map_every
         );
 
+        let stft = Stft::new(config.fft_len);
+        let track_audio = match decimation_factor(sample_rate) {
+            Some(_) => Some(TrackAudio {
+                mic_array: MicArray::uma16(),
+                grid_camera: Camera {
+                    intrinsics: camera.intrinsics.scaled(config.grid_width),
+                    mount: camera.mount.clone(),
+                },
+                grid_z: config.grid_z,
+                fft_len: config.fft_len,
+                stft_scale: stft.scale(),
+                sample_rate,
+            }),
+            None => {
+                println!(
+                    "No track audio: {sample_rate} Hz is no integer multiple of {TRACK_SAMPLE_RATE} Hz"
+                );
+                None
+            }
+        };
+
         Ok(Self {
-            stream: StftStream::new(Stft::new(config.fft_len)),
+            stream: StftStream::new(stft),
             cov: SlidingCovariance::new(n_bins, config.memory_frames),
             beamformer: make_beamformer(Steering::new(
                 &scan_grid,
@@ -153,7 +207,45 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
                 grid_width: scan_grid.width(),
                 grid_height: scan_grid.height(),
             },
+            peaks: peaks.clone(),
+            tracker: Tracker::new(tracking.clone()),
+            beams: Vec::new(),
+            track_audio,
         })
+    }
+}
+
+impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
+    /// Continue the tracks with the peaks of `power`, hand each track the audio of its beam since
+    /// the previous map, then point the beams at the new track positions.
+    fn update_tracks(&mut self, power: &[f64]) {
+        let size = [self.layout.grid_width, self.layout.grid_height];
+        self.tracker.update(&find_peaks(power, size, &self.peaks));
+
+        let tracks = self.tracker.tracks_mut();
+        self.beams.retain(|(id, _)| tracks.iter().any(|track| track.id == *id));
+        let Some(audio) = &self.track_audio else {
+            return;
+        };
+        for track in tracks {
+            let distances = audio.distances(track);
+            match self.beams.iter_mut().find(|(id, _)| *id == track.id) {
+                Some((_, beam)) => {
+                    track.samples = beam.take_output();
+                    beam.steer(&distances);
+                }
+                None => {
+                    track.samples = Vec::new();
+                    let beam = BeamSignal::new(
+                        audio.fft_len,
+                        audio.stft_scale,
+                        audio.sample_rate,
+                        &distances,
+                    );
+                    self.beams.push((track.id, beam));
+                }
+            }
+        }
     }
 }
 
@@ -161,12 +253,13 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
 ///
 /// The covariance is a sliding average over about `memory_frames` frames, so consecutive maps
 /// overlap.
-/// Each map is passed to `on_map` together with its [`MapLayout`]. Stops when the source ends
-/// (`Ok(0)`), when `on_map` returns `Break`, or on the first error from `source` or `on_map`.
+/// Each map is passed to `on_map` together with its [`MapLayout`] and the current tracks (each
+/// with its audio since the previous map). Stops when the source ends (`Ok(0)`), when `on_map`
+/// returns `Break`, or on the first error from `source` or `on_map`.
 pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
     source: &mut S,
     mut pipeline: Pipeline<M, B>,
-    mut on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
+    mut on_map: impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError>,
 ) -> Result<(), PipelineError> {
     let mut buf = vec![0.0; 1024 * M];
     let mut total_frames = 0;
@@ -182,9 +275,13 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
         }
         total_frames += frames;
 
-        // Closures capture disjoint fields, so `stream` and `cov` can be borrowed together
+        // Closures capture disjoint fields, so `stream`, `cov` and `beams` can be borrowed
+        // together
         pipeline.stream.push(&buf[..frames * M], |snapshots, _l| {
             pipeline.cov.accumulate(snapshots);
+            for (_, beam) in &mut pipeline.beams {
+                beam.push_frame(snapshots);
+            }
             new_frames += 1;
         });
 
@@ -201,7 +298,9 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             new_frames = 0;
             map_index += 1;
 
-            let flow = on_map(&out, &pipeline.layout).map_err(PipelineError::MapHandler)?;
+            pipeline.update_tracks(&out);
+            let flow = on_map(&out, &pipeline.layout, pipeline.tracker.tracks())
+                .map_err(PipelineError::MapHandler)?;
             if flow.is_break() {
                 break;
             }
@@ -213,4 +312,123 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
         total_frames as f64 / source.sample_rate()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::{f64::consts::PI, ops::ControlFlow};
+
+    use super::{Pipeline, PipelineConfig, run};
+    use crate::{
+        Point3,
+        dsp::{
+            beam_signal::TRACK_SAMPLE_RATE,
+            beamformer::clean_sc::CleanSc,
+        },
+        geometry::mic_array::MicArray,
+        peaks::PeakConfig,
+        source::simulator::{
+            Simulator,
+            scene::{MicNoiseParams, Scene, Source},
+            signal::{Signal, Sine},
+        },
+        test_util::{SAMPLE_RATE, test_camera},
+        tracking::{Track, TrackerConfig},
+    };
+
+    /// Amplitude of the component at `freq` (least squares fit of sine and cosine)
+    fn amplitude_at(signal: &[f32], freq: f64) -> f64 {
+        let (mut c, mut s) = (0.0, 0.0);
+        for (n, &y) in signal.iter().enumerate() {
+            let phase = 2.0 * PI * freq * n as f64 / TRACK_SAMPLE_RATE;
+            c += y as f64 * phase.cos();
+            s += y as f64 * phase.sin();
+        }
+        2.0 * (c * c + s * s).sqrt() / signal.len() as f64
+    }
+
+    /// Two sines on the focus plane: two confirmed tracks at the sources, each with audio in
+    /// which its own source dominates. CLEAN-SC, because the broad DAS main lobes of the two
+    /// sources overlap and pull both peaks about two cells toward each other.
+    #[test]
+    fn tracks_follow_sources_with_their_audio() {
+        let config = PipelineConfig::default();
+        let sources = [
+            (Point3::new(0.6, 0.2, config.grid_z), 3000.0),
+            (Point3::new(-0.6, 0.2, config.grid_z), 3500.0),
+        ];
+        let scene = Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s: 2.0,
+            mic_noise_params: MicNoiseParams {
+                seed: 1,
+                level_db: 20.0,
+            },
+            sources: sources
+                .iter()
+                .map(|&(pos, freq)| Source {
+                    pos,
+                    signal: Signal::Sine(Sine::new(1.0, freq, 0.0)),
+                })
+                .collect(),
+        };
+        let mut sim = Simulator::new(scene, MicArray::uma16()).unwrap();
+        let camera = test_camera();
+        let pipeline = Pipeline::new(
+            SAMPLE_RATE,
+            &config,
+            &PeakConfig::default(),
+            &TrackerConfig::default(),
+            camera.clone(),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true),
+        )
+        .unwrap();
+
+        // Last map's tracks, and all audio per track id
+        let mut last: Vec<Track> = Vec::new();
+        let mut audio: Vec<(u64, Vec<f32>)> = Vec::new();
+        run(&mut sim, pipeline, |_power, layout, tracks| {
+            for track in tracks {
+                match audio.iter_mut().find(|(id, _)| *id == track.id) {
+                    Some((_, samples)) => samples.extend_from_slice(&track.samples),
+                    None => audio.push((track.id, track.samples.clone())),
+                }
+            }
+            last = tracks.to_vec();
+            assert_eq!(layout.grid_width, config.grid_width as usize);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+
+        let confirmed: Vec<&Track> = last.iter().filter(|t| t.confirmed).collect();
+        assert_eq!(confirmed.len(), 2, "tracks: {last:?}");
+
+        let intrinsics = &camera.intrinsics;
+        let grid_width = config.grid_width as f64;
+        let grid_height = (grid_width * intrinsics.height as f64 / intrinsics.width as f64).round();
+        for (pos, freq) in sources {
+            // Source in grid cells, as `Intrinsics::scaled`
+            let (u, v) = camera.project(&pos);
+            let col = (u + 0.5) * grid_width / intrinsics.width as f64 - 0.5;
+            let row = (v + 0.5) * grid_height / intrinsics.height as f64 - 0.5;
+            let track = confirmed
+                .iter()
+                .min_by(|a, b| {
+                    let d = |t: &Track| (t.col - col).hypot(t.row - row);
+                    d(a).total_cmp(&d(b))
+                })
+                .unwrap();
+            let dist = (track.col - col).hypot(track.row - row);
+            assert!(dist < 1.0, "track at ({}, {}), source at ({col}, {row})", track.col, track.row);
+
+            let (_, samples) = audio.iter().find(|(id, _)| *id == track.id).unwrap();
+            // At least a second of audio
+            assert!(samples.len() > TRACK_SAMPLE_RATE as usize, "{} samples", samples.len());
+            let other = sources.iter().find(|(p, _)| *p != pos).unwrap().1;
+            let own_db = 20.0 * (amplitude_at(samples, freq) / amplitude_at(samples, other)).log10();
+            // About 30 dB and 12 dB: depends on where the other source falls in this beam's
+            // sidelobe pattern (near a null at 3.5 kHz, not at 3 kHz)
+            assert!(own_db > 8.0, "track {}: own source {own_db:.1} dB above the other", track.id);
+        }
+    }
 }

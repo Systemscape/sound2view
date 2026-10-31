@@ -8,6 +8,7 @@ use sound2view_core::{
     geometry::camera::{Camera, Intrinsics, Mount},
     peaks::PeakConfig,
     pipeline::PipelineConfig,
+    tracking::TrackerConfig,
 };
 
 /// Config file, looked up in the working directory
@@ -22,6 +23,7 @@ pub struct Config {
     pub beamformer: BeamformerConfig,
     pub display: DisplayConfig,
     pub peaks: PeakConfig,
+    pub tracking: TrackerConfig,
 }
 
 impl Config {
@@ -265,6 +267,7 @@ impl Config {
                 "peaks: range_db must be > 0, min_dist_cells >= 0, max_count >= 1".to_string(),
             );
         }
+        self.tracking.validate()?;
         if self.display.db_range <= 0.0 {
             return Err("display.db_range must be > 0".to_string());
         }

@@ -13,8 +13,8 @@ pub struct Stft {
     input_buf: Vec<f64>,
     output_buf: Vec<Complex64>,
     window: Vec<f64>,
-    /// Kept for debugging and testing
-    _scale: f64,
+    /// 1/sqrt(sum(window^2)), part of `weights`
+    scale: f64,
     weights: Vec<f64>,
 }
 
@@ -38,7 +38,7 @@ impl Stft {
             output_buf: plan.make_output_vec(),
             plan,
             window: hann_window,
-            _scale: scale,
+            scale,
             weights,
         }
     }
@@ -49,6 +49,11 @@ impl Stft {
 
     pub fn weights(&self) -> &[f64] {
         &self.weights
+    }
+
+    /// Scale factor 1/sqrt(sum(window^2)) applied with the window
+    pub fn scale(&self) -> f64 {
+        self.scale
     }
 
     pub fn transform(&mut self, frame: &[f64]) -> &[Complex64] {
@@ -205,7 +210,7 @@ mod test {
 
         // Scaling factor should be approx sqrt(8 / 3N)
         assert!(
-            (stft._scale - (8.0 / 3.0 / fft_len as f64).sqrt()).abs() < 1e-12,
+            (stft.scale() - (8.0 / 3.0 / fft_len as f64).sqrt()).abs() < 1e-12,
             "Scaling factor should be sqrt(8 / 3N)"
         )
     }

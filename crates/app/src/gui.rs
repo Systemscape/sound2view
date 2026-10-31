@@ -14,13 +14,14 @@ use eframe::egui::{
 };
 use sound2view_core::{
     BoxError, ImageSource, VideoFrame,
-    peaks::{Peak, PeakConfig, find_peaks},
+    peaks::PeakConfig,
     pipeline::{MapLayout, PipelineConfig},
     render,
     source::{
         capture::CpalSource,
         video::{CameraEntry, CameraSource, list_cameras},
     },
+    tracking::{Track, TrackerConfig},
 };
 
 use crate::{
@@ -130,6 +131,8 @@ struct MapData {
     /// [width, height] in grid pixels
     size: [usize; 2],
     power: Vec<f64>,
+    /// Tracks of this map, without their audio
+    tracks: Vec<Track>,
 }
 
 pub struct App {
@@ -141,10 +144,11 @@ pub struct App {
     last_map: Option<MapData>,
     /// Overlay range in dB below the map maximum; applies immediately
     db_range: f64,
-    /// Peak search; `enabled` is toggled in the GUI
+    /// Peak search of the pipeline, for the tooltip; `enabled` (show the dots) is toggled in the
+    /// GUI
     peaks: PeakConfig,
-    /// Peaks of `last_map`
-    found_peaks: Vec<Peak>,
+    /// Tracking of the pipeline, for the tooltip
+    tracking: TrackerConfig,
     /// Settings edited in the GUI
     settings: PipelineSettings,
     /// Settings read by the audio thread; updated from `settings` when no slider is dragged
@@ -213,7 +217,6 @@ impl eframe::App for App {
         }
 
         if redraw_map && let Some(map) = &self.last_map {
-            self.found_peaks = find_peaks(&map.power, map.size, &self.peaks);
             let rgba = render::map_rgba(&map.power, self.db_range);
             let image = ColorImage::from_rgba_unmultiplied(map.size, &rgba);
             // Linear filtering interpolates the coarse grid smoothly to the image size
@@ -264,7 +267,7 @@ impl eframe::App for App {
                     if self.peaks.enabled
                         && let Some(map) = &self.last_map
                     {
-                        draw_peaks(painter, rect, map.size, &self.found_peaks);
+                        draw_tracks(painter, rect, map.size, &map.tracks);
                     }
                 }
 
@@ -316,7 +319,7 @@ impl App {
             last_map: None,
             db_range: config.display.db_range,
             peaks: config.peaks.clone(),
-            found_peaks: Vec::new(),
+            tracking: config.tracking.clone(),
             settings,
             shared_settings,
             camera,
@@ -454,24 +457,36 @@ impl App {
             .changed();
 
         ui.add_space(16.0);
-        ui.checkbox(&mut self.peaks.enabled, "Peaks")
+        ui.checkbox(&mut self.peaks.enabled, "Sources")
             .on_hover_text(format!(
-                "Blue dots at the estimated source positions: local maxima of the map within {} \
-                 dB of the loudest point, at least {} grid cells apart, at most {}. The label is \
-                 the level relative to the loudest point.",
-                self.peaks.range_db, self.peaks.min_dist_cells, self.peaks.max_count
+                "Blue dots at the tracked sources: local maxima of the map within {} dB of the \
+                 loudest point, at least {} grid cells apart, at most {}, followed from map to \
+                 map. A dot appears after {} maps in a row and stays up to {} maps after its \
+                 peak is gone. The label is the track number and the level relative to the \
+                 loudest point.",
+                self.peaks.range_db,
+                self.peaks.min_dist_cells,
+                self.peaks.max_count,
+                self.tracking.min_hits,
+                self.tracking.max_missed
             ));
         db_range_changed
     }
 }
 
-/// Dot with level label per peak; `rect` is where the map is drawn, `size` its grid size
-fn draw_peaks(painter: &egui::Painter, rect: Rect, [width, height]: [usize; 2], peaks: &[Peak]) {
+/// Dot with id and level per confirmed track; `rect` is where the map is drawn, `size` its grid
+/// size
+fn draw_tracks(
+    painter: &egui::Painter,
+    rect: Rect,
+    [width, height]: [usize; 2],
+    tracks: &[Track],
+) {
     let font = FontId::proportional(PEAK_FONT_SIZE);
-    for peak in peaks {
+    for track in tracks.iter().filter(|track| track.confirmed) {
         // Grid cell centers at (col + 0.5) / width of the image
-        let x = rect.left() + (peak.col as f32 + 0.5) / width as f32 * rect.width();
-        let y = rect.top() + (peak.row as f32 + 0.5) / height as f32 * rect.height();
+        let x = rect.left() + (track.col as f32 + 0.5) / width as f32 * rect.width();
+        let y = rect.top() + (track.row as f32 + 0.5) / height as f32 * rect.height();
         let center = pos2(x, y);
         painter.circle(
             center,
@@ -482,7 +497,7 @@ fn draw_peaks(painter: &egui::Painter, rect: Rect, [width, height]: [usize; 2], 
         painter.text(
             pos2(x + PEAK_RADIUS + 4.0, y),
             Align2::LEFT_CENTER,
-            format!("{:.1} dB", peak.level_db),
+            format!("#{} {:.1} dB", track.id, track.level_db),
             font.clone(),
             Color32::WHITE,
         );
@@ -650,11 +665,21 @@ fn spawn_audio(
                 config.pipeline = current.pipeline.clone();
                 let mut gui_closed = false;
 
-                let on_map =
-                    |power: &[f64], layout: &MapLayout| -> Result<ControlFlow<()>, BoxError> {
+                let on_map = |power: &[f64],
+                              layout: &MapLayout,
+                              tracks: &[Track]|
+                 -> Result<ControlFlow<()>, BoxError> {
+                        let tracks = tracks
+                            .iter()
+                            .map(|track| Track {
+                                samples: Vec::new(),
+                                ..track.clone()
+                            })
+                            .collect();
                         let map = MapData {
                             size: [layout.grid_width, layout.grid_height],
                             power: power.to_vec(),
+                            tracks,
                         };
                         match tx.try_send(map) {
                             Ok(()) => ctx.request_repaint(),

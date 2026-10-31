@@ -68,7 +68,8 @@ clean_beam_cells = 1.5
 db_range = 3.0
 
 [peaks]
-# Estimated source positions (blue dots): local maxima of the map (toggle in the GUI)
+# Local maxima of each map, followed as tracks (see [tracking])
+# Show the tracks as blue dots (toggle "Sources" in the GUI)
 enabled = true
 # Only maxima at most this many dB below the map maximum
 range_db = 6.0
@@ -76,3 +77,13 @@ range_db = 6.0
 min_dist_cells = 4.0
 # At most this many peaks, strongest first
 max_count = 5
+
+[tracking]
+# A peak continues a track if it is at most this far away, in grid cells
+max_dist_cells = 6.0
+# Maps in a row with a matching peak until a track is shown (and recorded in the CLI modes)
+min_hits = 3
+# Maps in a row without a matching peak until a track is dropped
+max_missed = 5
+# Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly
+smoothing = 0.5

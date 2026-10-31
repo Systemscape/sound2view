@@ -1,7 +1,9 @@
 use std::{
+    collections::{HashMap, hash_map::Entry},
     env,
     error::Error,
-    fs,
+    fs::{self, File},
+    io::BufWriter,
     ops::ControlFlow,
     thread,
     time::{Duration, Instant},
@@ -14,7 +16,7 @@ use sound2view_core::{
         Normalization, clean_sc::CleanSc, delay_and_sum::Das, functional::Functional,
     },
     geometry::mic_array::MicArray,
-    peaks::{PeakConfig, find_peaks},
+    dsp::beam_signal::TRACK_SAMPLE_RATE,
     pipeline::{MapLayout, Pipeline, PipelineError, run},
     render,
     source::{
@@ -22,6 +24,7 @@ use sound2view_core::{
         simulator::{Simulator, scene::Scene},
         video::{self, CameraSource},
     },
+    tracking::Track,
 };
 
 use crate::config::{CONFIG_PATH, Config, Method};
@@ -30,7 +33,7 @@ mod config;
 mod gui;
 mod theme;
 
-/// Number of maps written in mic mode
+/// Number of maps written in mic mode, unless given as argument
 const MIC_MAPS: usize = 20;
 /// Frames timed in camshot mode
 const CAMSHOT_FRAMES: usize = 60;
@@ -39,7 +42,8 @@ const CAMERA_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Usage (settings from `sound2view.toml`, see `config.rs`):
 /// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
-/// - `sound2view mic`: capture from the UMA-16
+/// - `sound2view mic [maps]`: capture from the UMA-16, `MIC_MAPS` maps unless given (about 9 per
+///   second)
 /// - `sound2view probe`: list audio input devices
 /// - `sound2view camprobe`: list cameras and their formats
 /// - `sound2view camshot`: time camera frames and save one as `camshot.png`
@@ -64,7 +68,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             video::initialize();
             run_gui(Config::load(CONFIG_PATH)?)
         }
-        "mic" => run_mic(&Config::load(CONFIG_PATH)?),
+        "mic" => {
+            let maps = match env::args().nth(2) {
+                Some(n) => n.parse().map_err(|_| format!("mic: not a map count: {n}"))?,
+                None => MIC_MAPS,
+            };
+            run_mic(&Config::load(CONFIG_PATH)?, maps)
+        }
         path => run_sim(path, &Config::load(CONFIG_PATH)?),
     }
 }
@@ -113,12 +123,12 @@ fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     let sample_rate = scene.sample_rate;
     let mut sim = Simulator::new(scene, MicArray::uma16())?;
 
-    let on_map = save_maps(src_pos, None, config.peaks.clone());
+    let on_map = save_maps(src_pos, None, config.peaks.enabled);
     run_configured(&mut sim, sample_rate, config, on_map)?;
     Ok(())
 }
 
-fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
+fn run_mic(config: &Config, maps: usize) -> Result<(), Box<dyn Error>> {
     let audio = &config.audio;
     println!(
         "Capturing from {} at {} Hz",
@@ -131,7 +141,7 @@ fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
         &mut mic,
         sample_rate,
         config,
-        save_maps(Vec::new(), Some(MIC_MAPS), config.peaks.clone()),
+        save_maps(Vec::new(), Some(maps), config.peaks.enabled),
     )?;
 
     println!("dropped {} chunks", mic.dropped());
@@ -145,21 +155,22 @@ fn run_configured<S: FrameSource<16>>(
     source: &mut S,
     sample_rate: f64,
     config: &Config,
-    on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
+    on_map: impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError>,
 ) -> Result<(), PipelineError> {
     let camera = config.camera.camera();
     let pipeline = &config.pipeline;
     let b = &config.beamformer;
+    let (peaks, tracking) = (&config.peaks, &config.tracking);
 
     match b.method {
         Method::Das => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
                 Das::new(steering, true, Normalization::TrueLocation)
             })?;
             run(source, pipeline, on_map)
         }
         Method::Functional => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
                 Functional::new(
                     steering,
                     b.nu,
@@ -170,7 +181,7 @@ fn run_configured<S: FrameSource<16>>(
             run(source, pipeline, on_map)
         }
         Method::CleanSc => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
+            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
                 CleanSc::new(
                     steering,
                     b.clean_gain,
@@ -186,28 +197,59 @@ fn run_configured<S: FrameSource<16>>(
 }
 
 /// Map handler for `run`: writes each map as `map_NNN.png` with a red cross per `src_pos` and a
-/// blue dot per peak (if `peaks.enabled`).
+/// blue dot per confirmed track (if `show_tracks`), and the audio of each confirmed track to
+/// `track_NNN.wav` (see [`TrackRecorder`]).
 ///
 /// Stops after `max_maps` maps; `None` runs until the stream ends.
 fn save_maps(
     src_pos: Vec<Point3>,
     max_maps: Option<usize>,
-    peaks: PeakConfig,
-) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError> {
+    show_tracks: bool,
+) -> impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError> {
     let mut i = 0;
-    move |power, layout| {
-        let found = if peaks.enabled {
-            find_peaks(power, [layout.grid_width, layout.grid_height], &peaks)
-        } else {
-            Vec::new()
-        };
-        render::map_image(power, layout, &src_pos, &found).save(format!("map_{i:03}.png"))?;
+    let mut recorder = TrackRecorder::default();
+    move |power, layout, tracks| {
+        let shown = if show_tracks { tracks } else { &[] };
+        render::map_image(power, layout, &src_pos, shown).save(format!("map_{i:03}.png"))?;
+        recorder.record(tracks)?;
         i += 1;
         if max_maps.is_some_and(|max| i >= max) {
             Ok(ControlFlow::Break(()))
         } else {
             Ok(ControlFlow::Continue(()))
         }
+    }
+}
+
+/// Writes the audio of each confirmed track to `track_NNN.wav` (NNN = track id), mono 32-bit
+/// float at `TRACK_SAMPLE_RATE`, to check by ear whether a beam isolates its source. Audio from
+/// before the confirmation is not written. The files are finalized when the recorder is dropped.
+#[derive(Default)]
+struct TrackRecorder {
+    writers: HashMap<u64, hound::WavWriter<BufWriter<File>>>,
+}
+
+impl TrackRecorder {
+    fn record(&mut self, tracks: &[Track]) -> Result<(), BoxError> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: TRACK_SAMPLE_RATE as u32,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        for track in tracks.iter().filter(|track| track.confirmed) {
+            let writer = match self.writers.entry(track.id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let path = format!("track_{:03}.wav", track.id);
+                    entry.insert(hound::WavWriter::create(path, spec)?)
+                }
+            };
+            for &sample in &track.samples {
+                writer.write_sample(sample)?;
+            }
+        }
+        Ok(())
     }
 }
 
