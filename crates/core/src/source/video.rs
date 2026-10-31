@@ -125,11 +125,11 @@ impl CameraSource {
         let lower = name.to_lowercase();
         let mut last_error = None;
 
-        for info in query(ApiBackend::Auto)? {
-            if !info.human_name().to_lowercase().contains(&lower) {
+        for entry in list_cameras()? {
+            if !entry.name.to_lowercase().contains(&lower) {
                 continue;
             }
-            match Self::new(info.index().as_index()?, width, height, fps) {
+            match Self::new(entry.index, width, height, fps) {
                 Ok(camera) => return Ok(camera),
                 Err(e) => last_error = Some(e),
             }
@@ -137,6 +137,31 @@ impl CameraSource {
 
         Err(last_error.unwrap_or_else(|| VideoError::NotFound(name.to_string())))
     }
+}
+
+/// A camera as listed by the OS
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraEntry {
+    /// V4L2: N of `/dev/videoN`; AVFoundation: position in the device list
+    pub index: u32,
+    pub name: String,
+}
+
+/// All cameras, in OS order. One camera can show up several times (e.g. a V4L2 metadata node
+/// that cannot stream).
+pub fn list_cameras() -> Result<Vec<CameraEntry>, VideoError> {
+    if !is_authorized() {
+        return Err(VideoError::NotAuthorized);
+    }
+    query(ApiBackend::Auto)?
+        .into_iter()
+        .map(|info| {
+            Ok(CameraEntry {
+                index: info.index().as_index()?,
+                name: info.human_name(),
+            })
+        })
+        .collect()
 }
 
 impl ImageSource for CameraSource {

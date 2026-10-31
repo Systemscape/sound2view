@@ -16,7 +16,10 @@ use sound2view_core::{
     BoxError, ImageSource, VideoFrame,
     pipeline::{MapLayout, PipelineConfig},
     render,
-    source::{capture::CpalSource, video::CameraSource},
+    source::{
+        capture::CpalSource,
+        video::{CameraEntry, CameraSource, list_cameras},
+    },
 };
 
 use crate::{
@@ -121,8 +124,10 @@ pub struct App {
     settings: PipelineSettings,
     /// Settings read by the audio thread; updated from `settings` when no slider is dragged
     shared_settings: Arc<Mutex<PipelineSettings>>,
-    /// Written by the camera thread
-    camera_status: Arc<Mutex<DeviceStatus>>,
+    /// Camera selection, status and list, shared with the camera thread
+    camera: Arc<CameraShared>,
+    /// `camera.name` from the config, shown for `CameraChoice::Auto`
+    camera_name: String,
     /// Written by the audio thread
     audio_status: Arc<Mutex<DeviceStatus>>,
 }
@@ -148,7 +153,7 @@ impl eframe::App for App {
             redraw_map = true;
         }
 
-        let camera_status = self.camera_status.lock().unwrap().clone();
+        let camera_status = self.camera.status.lock().unwrap().clone();
         let audio_status = self.audio_status.lock().unwrap().clone();
 
         let top_frame = egui::Frame::new()
@@ -158,6 +163,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("sound2view").strong().size(18.0));
                 ui.add_space(24.0);
+                self.camera_control(ui);
+                ui.add_space(16.0);
                 redraw_map |= self.controls(ui);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -238,15 +245,15 @@ impl App {
             pipeline: config.pipeline.clone(),
         };
         let shared_settings = Arc::new(Mutex::new(settings.clone()));
-        let camera_status = Arc::new(Mutex::new(DeviceStatus::Opening));
+        let camera = Arc::new(CameraShared {
+            choice: Mutex::new(CameraChoice::Auto),
+            status: Mutex::new(DeviceStatus::Opening),
+            cameras: Mutex::new(Vec::new()),
+        });
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
 
         Self {
-            rx: spawn_camera(
-                cc.egui_ctx.clone(),
-                config.camera.clone(),
-                Arc::clone(&camera_status),
-            ),
+            rx: spawn_camera(cc.egui_ctx.clone(), config.camera.clone(), Arc::clone(&camera)),
             texture: None,
             map_rx: spawn_audio(
                 cc.egui_ctx.clone(),
@@ -259,8 +266,45 @@ impl App {
             db_range: config.display.db_range,
             settings,
             shared_settings,
-            camera_status,
+            camera,
+            camera_name: config.camera.name.clone(),
             audio_status,
+        }
+    }
+
+    /// Camera dropdown: "Auto" (first camera matching `camera.name`) or one listed camera.
+    /// The field of view in the config belongs to the configured camera, so the overlay only
+    /// fits other cameras with the same field of view.
+    fn camera_control(&self, ui: &mut egui::Ui) {
+        let cameras = self.camera.cameras.lock().unwrap().clone();
+        let current = self.camera.choice.lock().unwrap().clone();
+        let auto_label = format!("Auto ({})", self.camera_name);
+        let entry_label = |entry: &CameraEntry| format!("{} ({})", entry.name, entry.index);
+
+        let selected_text = match &current {
+            CameraChoice::Auto => auto_label.clone(),
+            CameraChoice::Index(index) => cameras
+                .iter()
+                .find(|entry| entry.index == *index)
+                .map_or_else(|| format!("Camera {index}"), entry_label),
+        };
+
+        let mut choice = current.clone();
+        label(ui, "Camera");
+        egui::ComboBox::from_id_salt("camera")
+            .selected_text(selected_text)
+            .width(CAMERA_COMBO_WIDTH)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, CameraChoice::Auto, auto_label);
+                for entry in &cameras {
+                    let label = entry_label(entry);
+                    ui.selectable_value(&mut choice, CameraChoice::Index(entry.index), label);
+                }
+            });
+
+        if choice != current {
+            *self.camera.choice.lock().unwrap() = choice;
+            set_status(ui.ctx(), &self.camera.status, DeviceStatus::Opening);
         }
     }
 
@@ -339,29 +383,63 @@ fn set_status(ctx: &egui::Context, status: &Mutex<DeviceStatus>, new: DeviceStat
     ctx.request_repaint();
 }
 
+/// Which camera the camera thread opens
+#[derive(Clone, Debug, PartialEq)]
+enum CameraChoice {
+    /// First camera whose name contains `camera.name` from the config
+    Auto,
+    /// Camera with this index, see `CameraEntry`
+    Index(u32),
+}
+
+/// Camera state shared between the GUI and the camera thread
+struct CameraShared {
+    /// Set by the GUI; the thread reopens when it changes
+    choice: Mutex<CameraChoice>,
+    /// Set by the thread
+    status: Mutex<DeviceStatus>,
+    /// Cameras for the dropdown; refreshed by the thread on every open attempt
+    cameras: Mutex<Vec<CameraEntry>>,
+}
+
+/// Width of the camera dropdown; camera names are long
+const CAMERA_COMBO_WIDTH: f32 = 260.0;
+/// The camera thread checks for another selection this often while it waits
+const CHOICE_POLL: Duration = Duration::from_millis(100);
+
 /// Camera thread: sends frames, drops them while the GUI has not taken the previous one.
 ///
-/// Retries opening every `RETRY` until the camera is there, and reopens it when it fails
-/// (e.g. unplugged). A single bad frame does not count as lost.
+/// Opens the camera selected in `shared.choice` and reopens when the selection changes. Retries
+/// every `RETRY` until the camera is there, and reopens it when it fails (e.g. unplugged). A
+/// single bad frame does not count as lost.
 fn spawn_camera(
     ctx: egui::Context,
     config: CameraConfig,
-    status: Arc<Mutex<DeviceStatus>>,
+    shared: Arc<CameraShared>,
 ) -> Receiver<VideoFrame> {
     let (tx, rx) = sync_channel(1);
 
     thread::spawn(move || {
         loop {
-            let camera =
-                CameraSource::open_by_name(&config.name, config.width, config.height, config.fps);
+            let choice = shared.choice.lock().unwrap().clone();
+            // Also while no camera can be opened, so a newly plugged one shows up
+            if let Ok(cameras) = list_cameras() {
+                *shared.cameras.lock().unwrap() = cameras;
+            }
+
+            let (width, height, fps) = (config.width, config.height, config.fps);
+            let camera = match &choice {
+                CameraChoice::Auto => CameraSource::open_by_name(&config.name, width, height, fps),
+                CameraChoice::Index(index) => CameraSource::new(*index, width, height, fps),
+            };
             let mut camera = match camera {
                 Ok(camera) => {
-                    set_status(&ctx, &status, DeviceStatus::Running);
+                    set_status(&ctx, &shared.status, DeviceStatus::Running);
                     camera
                 }
                 Err(e) => {
-                    set_status(&ctx, &status, DeviceStatus::Missing(e.to_string()));
-                    thread::sleep(RETRY);
+                    set_status(&ctx, &shared.status, DeviceStatus::Missing(e.to_string()));
+                    wait_for_other_choice(&shared.choice, &choice, RETRY);
                     continue;
                 }
             };
@@ -369,6 +447,10 @@ fn spawn_camera(
             let mut failed = 0;
             let mut last_error = String::new();
             while failed < CAMERA_MAX_FAILED_FRAMES {
+                // Another camera selected: drop this one (end of the loop body), then open it
+                if *shared.choice.lock().unwrap() != choice {
+                    break;
+                }
                 let frame = match camera.next_frame() {
                     Ok(frame) => frame,
                     Err(e) => {
@@ -384,11 +466,22 @@ fn spawn_camera(
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
-            set_status(&ctx, &status, DeviceStatus::Lost(last_error));
+            if failed >= CAMERA_MAX_FAILED_FRAMES {
+                set_status(&ctx, &shared.status, DeviceStatus::Lost(last_error));
+            }
         }
     });
 
     rx
+}
+
+/// Sleep up to `timeout`, but return as soon as the GUI selects another camera than `current`
+fn wait_for_other_choice(choice: &Mutex<CameraChoice>, current: &CameraChoice, timeout: Duration) {
+    let mut waited = Duration::ZERO;
+    while waited < timeout && *choice.lock().unwrap() == *current {
+        thread::sleep(CHOICE_POLL);
+        waited += CHOICE_POLL;
+    }
 }
 
 /// Audio thread: UMA-16 capture and pipeline, sends each power map to the GUI.
