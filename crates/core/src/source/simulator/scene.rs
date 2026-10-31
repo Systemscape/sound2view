@@ -19,25 +19,42 @@ pub struct Scene {
     pub sources: Vec<Source>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SceneError {
+    #[error("scene file: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("invalid scene: {0}")]
+    Invalid(String),
+}
+
 impl Scene {
-    /// Parse a scene from TOML. Does not validate; call `validate()` afterwards.
-    pub fn from_toml(toml: &str) -> Result<Scene, toml::de::Error> {
-        toml::from_str(toml)
+    /// Parse a scene from TOML. Does not validate; `Simulator::new` does.
+    pub fn from_toml(toml: &str) -> Result<Scene, SceneError> {
+        Ok(toml::from_str(toml)?)
     }
 
-    /// Panics if the scene is physically invalid.
-    pub fn validate(&self) {
-        assert!(self.duration_s > 0.0, "duration must be >0");
-        assert!(self.sample_rate > 0.0, "sample_rate must be >0");
+    /// Error if the scene is physically invalid.
+    pub fn validate(&self) -> Result<(), SceneError> {
+        let invalid = |message: String| Err(SceneError::Invalid(message));
 
-        for source in &self.sources {
-            assert!(source.pos.z > 0.0, "Source z coordinates must be >0");
-            assert!(
-                source.signal.max_freq() < self.sample_rate / 2.0,
-                "max_freq {} must be below sample_rate/2",
-                source.signal.max_freq()
-            );
+        if self.duration_s <= 0.0 {
+            return invalid("duration_s must be > 0".to_string());
         }
+        if self.sample_rate <= 0.0 {
+            return invalid("sample_rate must be > 0".to_string());
+        }
+        for (i, source) in self.sources.iter().enumerate() {
+            if source.pos.z <= 0.0 {
+                return invalid(format!("source {i}: z must be > 0"));
+            }
+            let max_freq = source.signal.max_freq();
+            if max_freq >= self.sample_rate / 2.0 {
+                return invalid(format!(
+                    "source {i}: max frequency {max_freq} Hz must be below sample_rate/2"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

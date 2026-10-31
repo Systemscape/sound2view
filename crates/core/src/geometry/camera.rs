@@ -49,6 +49,10 @@ pub struct Intrinsics {
     pub cx: f64,
     /// principal point, y-coordinate of pixel center
     pub cy: f64,
+    /// Distortion coefficients in OpenCV order (k1, k2, p1, p2, k3), acting on normalized
+    /// coordinates; zero = plain pinhole
+    #[serde(default)]
+    pub dist: [f64; 5],
 }
 
 impl Intrinsics {
@@ -66,6 +70,7 @@ impl Intrinsics {
             fy: (width as f64 / 2.0) / (hfov / 2.0).tan(),
             cx: (width as f64 - 1.0) / 2.0,
             cy: (height as f64 - 1.0) / 2.0,
+            dist: [0.0; 5],
         }
     }
 
@@ -85,30 +90,78 @@ impl Intrinsics {
             fy: self.fy * s_y,
             cx: (self.cx + 0.5) * s_x - 0.5,
             cy: (self.cy + 0.5) * s_y - 0.5,
+            // Acts on normalized coordinates, independent of the resolution
+            dist: self.dist,
         }
     }
 
-    /// Project a pixel center onto the camera frame
+    /// Project a pixel center onto the camera frame, removing lens distortion
     ///
     /// - `z`: focus distance along the optical axis, must be >0
     ///
     /// Panics if `z <= 0`
     pub fn unproject(&self, u: f64, v: f64, z: f64) -> Point3 {
         assert!(z > 0.0, "z must be > 0");
-        Point3::new((u - self.cx) * z / self.fx, (v - self.cy) * z / self.fy, z)
+        let (x, y) = self.undistort((u - self.cx) / self.fx, (v - self.cy) / self.fy);
+        Point3::new(x * z, y * z, z)
     }
 
-    /// Project position `p` onto the image plane, returns (u,v)
+    /// Project position `p` onto the image plane, including lens distortion, returns (u,v)
     ///
     /// Panics if `p`'s z-coordinate is <=0
     pub fn project(&self, p: &Point3) -> (f64, f64) {
         assert!(p.z > 0.0, "p.z must be > 0");
-        let u = self.cx + self.fx * p.x / p.z;
-        let v = self.cy + self.fy * p.y / p.z;
+        let (x, y) = self.distort(p.x / p.z, p.y / p.z);
+        let u = self.cx + self.fx * x;
+        let v = self.cy + self.fy * y;
 
         (u, v)
     }
+
+    /// Brown-Conrady distortion (OpenCV's 5-coefficient model) of normalized coordinates
+    /// x = X/Z, y = Y/Z
+    fn distort(&self, x: f64, y: f64) -> (f64, f64) {
+        let radial = self.radial(x, y);
+        let (dx, dy) = self.tangential(x, y);
+        (x * radial + dx, y * radial + dy)
+    }
+
+    /// Inverse of [`Self::distort`] by fixed-point iteration, as OpenCV's `undistortPoints`.
+    ///
+    /// Converges linearly; for the calibrated camera the error shrinks by ~0.4 per step in the
+    /// worst image corner, so `UNDISTORT_ITER` steps reach machine precision. Runs once per scan
+    /// grid point, so the cost does not matter.
+    fn undistort(&self, x_d: f64, y_d: f64) -> (f64, f64) {
+        let (mut x, mut y) = (x_d, y_d);
+        for _ in 0..UNDISTORT_ITER {
+            let radial = self.radial(x, y);
+            let (dx, dy) = self.tangential(x, y);
+            x = (x_d - dx) / radial;
+            y = (y_d - dy) / radial;
+        }
+        (x, y)
+    }
+
+    /// Radial factor 1 + k1 r^2 + k2 r^4 + k3 r^6
+    fn radial(&self, x: f64, y: f64) -> f64 {
+        let [k1, k2, _, _, k3] = self.dist;
+        let r2 = x * x + y * y;
+        1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+    }
+
+    /// Tangential offset (decentered lens)
+    fn tangential(&self, x: f64, y: f64) -> (f64, f64) {
+        let [_, _, p1, p2, _] = self.dist;
+        let r2 = x * x + y * y;
+        (
+            2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+            p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+        )
+    }
 }
+
+/// Fixed-point iterations in [`Intrinsics::undistort`]
+const UNDISTORT_ITER: usize = 40;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Mount {
@@ -143,9 +196,102 @@ mod test {
 
     use crate::{
         Point3, Vector3,
-        geometry::camera::{Camera, Mount},
+        geometry::camera::{Camera, Intrinsics, Mount},
         test_util::test_camera,
     };
+
+    /// Calibrated icspring camera (OpenCV, 1920x1080)
+    fn calibrated_intrinsics() -> Intrinsics {
+        Intrinsics {
+            width: 1920,
+            height: 1080,
+            fx: 1046.19,
+            fy: 1046.79,
+            cx: 986.79,
+            cy: 608.80,
+            dist: [-0.0382, 0.0720, -0.0000794, 0.000768, -0.0516],
+        }
+    }
+
+    /// Reference values from OpenCV `projectPoints` with the same intrinsics
+    #[test]
+    fn project_matches_opencv() {
+        let intrinsics = calibrated_intrinsics();
+        let cases = [
+            (
+                Point3::new(0.5, 0.3, 1.0),
+                (1507.033982435592, 920.933146584083),
+            ),
+            (
+                Point3::new(-0.9, -0.5, 1.0),
+                (67.116889765618, 97.015941084352),
+            ),
+            (
+                Point3::new(0.2, -0.4, 2.0),
+                (1091.28690021129, 399.76257734392),
+            ),
+        ];
+        for (p, (u_ref, v_ref)) in cases {
+            let (u, v) = intrinsics.project(&p);
+            assert!(
+                (u - u_ref).abs() < 1e-6 && (v - v_ref).abs() < 1e-6,
+                "{p}: expected ({u_ref}, {v_ref}), got ({u}, {v})"
+            );
+        }
+    }
+
+    /// Undistortion inverts distortion over the whole image, corners included
+    #[test]
+    fn distorted_roundtrip_unproject_project() {
+        let intrinsics = calibrated_intrinsics();
+        let z = 2.0;
+        let (w, h) = (
+            intrinsics.width as f64 - 1.0,
+            intrinsics.height as f64 - 1.0,
+        );
+
+        let pixels = [
+            (0.0, 0.0),
+            (w, 0.0),
+            (0.0, h),
+            (w, h),
+            (w / 2.0, h / 2.0),
+            (100.0, 700.0),
+        ];
+        for (u, v) in pixels {
+            let p = intrinsics.unproject(u, v, z);
+            assert_eq!(p.z, z);
+            let (u_back, v_back) = intrinsics.project(&p);
+            assert!(
+                (u_back - u).abs() < 1e-9 && (v_back - v).abs() < 1e-9,
+                "({u}, {v}) came back as ({u_back}, {v_back})"
+            );
+        }
+    }
+
+    /// Distortion keeps the principal point on the optical axis
+    #[test]
+    fn distorted_principal_point_on_axis() {
+        let intrinsics = calibrated_intrinsics();
+        let p = intrinsics.unproject(intrinsics.cx, intrinsics.cy, 3.0);
+        assert!(p.x.abs() < 1e-12 && p.y.abs() < 1e-12, "got {p}");
+    }
+
+    /// Scaling keeps the distortion: the same ray hits the same relative image position
+    #[test]
+    fn scaled_keeps_distortion() {
+        let full = calibrated_intrinsics();
+        let small = full.scaled(64);
+        let p = Point3::new(-0.7, 0.4, 1.0);
+
+        let (u, v) = full.project(&p);
+        let (u_s, v_s) = small.project(&p);
+        // Pixel-center convention: (u + 0.5) scales with the resolution
+        let s_x = small.width as f64 / full.width as f64;
+        let s_y = small.height as f64 / full.height as f64;
+        assert!(((u + 0.5) * s_x - 0.5 - u_s).abs() < 1e-9);
+        assert!(((v + 0.5) * s_y - 0.5 - v_s).abs() < 1e-9);
+    }
 
     #[test]
     fn roundtrip_project_unproject() {

@@ -5,16 +5,25 @@ use image::{
     imageops::{self, FilterType},
 };
 
-use crate::{Point3, pipeline::MapLayout};
+use crate::{Point3, peaks::Peak, pipeline::MapLayout};
 
 /// Marker half length in camera pixels
 const MARKER_HALF_LEN: i64 = 10;
+/// Radius of the dot per estimated source in camera pixels
+const PEAK_RADIUS: i64 = 8;
 
-/// Power map as image at camera resolution, with a cross per true source.
+/// Power map as image at camera resolution, with a red cross per true source and a blue dot per
+/// peak.
 ///
 /// - `power`: row-major like the scan grid, `grid_width * grid_height` values
 /// - `src_pos`: true source positions, array frame
-pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbImage {
+/// - `peaks`: estimated sources in grid cells, see [`crate::peaks::find_peaks`]
+pub fn map_image(
+    power: &[f64],
+    layout: &MapLayout,
+    src_pos: &[Point3],
+    peaks: &[Peak],
+) -> RgbImage {
     // One grid pixel per map value; x = col, y = row, same as `power[row * w + col]`
     let w = layout.grid_width;
     let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -30,6 +39,24 @@ pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbIm
         intrinsics.height,
         FilterType::Nearest,
     );
+
+    // Grid cell centers to camera pixel centers, as `Intrinsics::scaled`
+    let s_x = intrinsics.width as f64 / layout.grid_width as f64;
+    let s_y = intrinsics.height as f64 / layout.grid_height as f64;
+    for peak in peaks {
+        let u = ((peak.col + 0.5) * s_x - 0.5).round() as i64;
+        let v = ((peak.row + 0.5) * s_y - 0.5).round() as i64;
+        for dy in -PEAK_RADIUS..=PEAK_RADIUS {
+            for dx in -PEAK_RADIUS..=PEAK_RADIUS {
+                let (x, y) = (u + dx, v + dy);
+                let inside =
+                    (0..big.width() as i64).contains(&x) && (0..big.height() as i64).contains(&y);
+                if dx * dx + dy * dy <= PEAK_RADIUS * PEAK_RADIUS && inside {
+                    big.put_pixel(x as u32, y as u32, Rgb([40, 120, 255]));
+                }
+            }
+        }
+    }
 
     for pos in src_pos {
         // `project` panics behind the camera
@@ -50,6 +77,28 @@ pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbIm
     }
 
     big
+}
+
+/// Largest overlay alpha, at 0 dB; the camera image stays visible underneath
+const OVERLAY_ALPHA_MAX: f64 = 200.0;
+
+/// Power map as RGBA overlay at grid resolution, row-major like the scan grid, unmultiplied alpha.
+///
+/// Normalized to the map maximum. Fully transparent at `db_range` dB below the maximum and lower;
+/// from there yellow to red and increasingly opaque up to 0 dB.
+pub fn map_rgba(power: &[f64], db_range: f64) -> Vec<u8> {
+    let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    power
+        .iter()
+        .flat_map(|&p| {
+            let db = 10.0 * (p / p_max).max(1e-10).log10();
+            // -db_range dB -> 0, 0 dB -> 1
+            let t = ((db + db_range) / db_range).clamp(0.0, 1.0);
+            let green = (255.0 * (1.0 - t)) as u8;
+            let alpha = (OVERLAY_ALPHA_MAX * t) as u8;
+            [255, green, 0, alpha]
+        })
+        .collect()
 }
 
 /// Map power to gray: 0 dB (the maximum) is white, -15 dB and below is black.

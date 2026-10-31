@@ -4,7 +4,7 @@ use crate::{
     FrameSource, distance_to_delay,
     geometry::mic_array::MicArray,
     source::simulator::{
-        scene::{MicNoise, Scene},
+        scene::{MicNoise, Scene, SceneError},
         signal::Signal,
     },
 };
@@ -43,8 +43,9 @@ pub struct Simulator<const M: usize> {
 }
 
 impl<const M: usize> Simulator<M> {
-    pub fn new(scene: Scene, mic_array: MicArray<M>) -> Self {
-        let _: () = scene.validate();
+    /// Error if the scene is invalid, see [`Scene::validate`].
+    pub fn new(scene: Scene, mic_array: MicArray<M>) -> Result<Self, SceneError> {
+        scene.validate()?;
         let mut sim_sources = Vec::with_capacity(scene.sources.len());
 
         for source in &scene.sources {
@@ -59,13 +60,13 @@ impl<const M: usize> Simulator<M> {
             });
         }
 
-        Simulator {
+        Ok(Simulator {
             n: 0,
             n_total: (scene.duration_s * scene.sample_rate).round() as u64,
             sim_sources,
             mic_noise: MicNoise::from(scene.mic_noise_params.clone()),
             scene,
-        }
+        })
     }
 }
 
@@ -123,7 +124,7 @@ mod tests {
         let sine = test_sine();
         let mic_array = MicArray::uma16();
 
-        let mut sim = Simulator::new(test_scene(-1000.0, DURATION_S), mic_array.clone());
+        let mut sim = Simulator::new(test_scene(-1000.0, DURATION_S), mic_array.clone()).unwrap();
         let buf = read_all(&mut sim, 1024);
 
         assert_eq!(
@@ -155,8 +156,14 @@ mod tests {
         let scene = test_scene(54.0, DURATION_S);
 
         // 7 does not divide N_FRAMES, so the last read is partial.
-        let chunked = read_all(&mut Simulator::new(scene.clone(), MicArray::uma16()), 7);
-        let single = read_all(&mut Simulator::new(scene, MicArray::uma16()), N_FRAMES);
+        let chunked = read_all(
+            &mut Simulator::new(scene.clone(), MicArray::uma16()).unwrap(),
+            7,
+        );
+        let single = read_all(
+            &mut Simulator::new(scene, MicArray::uma16()).unwrap(),
+            N_FRAMES,
+        );
 
         assert_eq!(chunked.len(), single.len());
         if let Some(i) = chunked.iter().zip(&single).position(|(a, b)| a != b) {

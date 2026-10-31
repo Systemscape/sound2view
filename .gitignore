@@ -1,3 +1,7 @@
 /target
 map_*.png
 *.pdf
+*.png
+
+.DS_Store
+*.swp

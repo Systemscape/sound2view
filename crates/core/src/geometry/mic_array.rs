@@ -7,11 +7,11 @@ use crate::{Complex64, Point3, distance_to_delay};
 /// UMA-16 v2 USB channel per mic, indexed `[row][col]`
 ///
 /// - row 0 = top = +y, col 0 = left = -x, viewed from the source side (z into the scene)
-/// - From Acoular `minidsp_uma-16.xml` (>= 24.03, corrected in x): channel = point - 1
-/// - Not yet verified on hardware: check that a source left of the array (as seen by the
-///   camera) peaks on the left of the map; if mirrored, reverse the columns
+/// - Verified on hardware with the camera overlay: a source left in the image peaks left
+/// - Equals Acoular `minidsp_uma-16_mirrored.xml` (channel = point - 1); the newer
+///   `minidsp_uma-16.xml` (>= 24.03) is mirrored in x relative to this convention
 pub const UMA16_CHANNELS: [[usize; 4]; 4] =
-    [[8, 9, 6, 7], [10, 11, 4, 5], [12, 13, 2, 3], [14, 15, 0, 1]];
+    [[7, 6, 9, 8], [5, 4, 11, 10], [3, 2, 13, 12], [1, 0, 15, 14]];
 
 /// A Microphone array with `M` elements.
 #[derive(Clone, Debug)]
@@ -125,7 +125,8 @@ mod test {
     fn test_uma16_geometry() {
         let uma16 = MicArray::uma16();
 
-        // (x, y) in meters, copied from the Acoular file
+        // (x, y) in meters, copied from Acoular `minidsp_uma-16.xml`; our x is mirrored
+        // relative to it (verified on hardware), so the check uses -x
         let expected: [(f64, f64); 16] = [
             (0.021, -0.063),
             (0.063, -0.063),
@@ -147,8 +148,8 @@ mod test {
 
         for (ch, (x, y)) in expected.into_iter().enumerate() {
             let p = uma16.mic_pos[ch];
-            let err = (p - Point3::new(x, y, 0.0)).norm();
-            assert!(err < 1e-12, "channel {ch}: expected ({x}, {y}), got {p}");
+            let err = (p - Point3::new(-x, y, 0.0)).norm();
+            assert!(err < 1e-12, "channel {ch}: expected ({}, {y}), got {p}", -x);
         }
     }
 

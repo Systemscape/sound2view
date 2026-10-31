@@ -1,6 +1,7 @@
 use std::ops::RangeInclusive;
 
 use nalgebra::SMatrix;
+use rayon::prelude::*;
 
 use crate::{
     Complex64,
@@ -89,10 +90,14 @@ impl<const M: usize> Beamformer<M> for Das<M> {
         out.fill(0.0);
 
         for k in bins {
-            // frequency of this bin
-
             let cov_k = &cov[k];
-            for (i, (c, out_i)) in self.normalization.iter().zip(out.iter_mut()).enumerate() {
+            // Grid points are independent: parallel over points, bins stay sequential
+            let points = self
+                .normalization
+                .par_iter()
+                .zip(out.par_iter_mut())
+                .enumerate();
+            points.for_each(|(i, (c, out_i))| {
                 let a = self.steering.vector(i, k);
                 let mut p = a.dotc(&(cov_k * a)).re;
 
@@ -105,7 +110,7 @@ impl<const M: usize> Beamformer<M> for Das<M> {
                         .sum::<f64>();
                 }
                 *out_i += p * c;
-            }
+            });
         }
     }
 }

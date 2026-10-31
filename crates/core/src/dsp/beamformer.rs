@@ -7,13 +7,19 @@ use crate::{
     geometry::{mic_array::MicArray, scan_grid::ScanGrid},
 };
 
+pub mod clean_sc;
 pub mod delay_and_sum;
+pub mod functional;
 
+/// Steering vectors for all scan grid points; the geometry is precomputed, the frequency part is
+/// built per call
 pub struct Steering<const M: usize> {
     /// Precomputed distances per grid point
     distances: Vec<[f64; M]>,
     /// FFT bin spacing in Hz
     df: f64,
+    /// [width, height] of the scan grid, row-major points
+    grid_size: [usize; 2],
 }
 impl<const M: usize> Steering<M> {
     /// Create a new Steering struct
@@ -35,6 +41,7 @@ impl<const M: usize> Steering<M> {
         Self {
             distances,
             df: f_s / fft_len as f64,
+            grid_size: [scan_grid.width(), scan_grid.height()],
         }
     }
 
@@ -43,6 +50,12 @@ impl<const M: usize> Steering<M> {
         self.distances.len()
     }
 
+    /// [width, height] of the scan grid; points are row-major
+    pub fn grid_size(&self) -> [usize; 2] {
+        self.grid_size
+    }
+
+    /// a(r, f_k) for grid point `point` and FFT bin `bin`, unnormalized (includes 1/r)
     pub fn vector(&self, point: usize, bin: usize) -> SVector<Complex64, M> {
         MicArray::steering_from_distances(&self.distances[point], bin as f64 * self.df)
     }

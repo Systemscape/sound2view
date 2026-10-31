@@ -1,89 +1,70 @@
-//! Camera capture via nokhwa (V4L2 on Linux, AVFoundation on macOS).
+//! Camera capture: V4L2 via nokhwa on Linux, AVFoundation via objc2 on macOS.
+//!
+//! Both backends provide `CameraSource` (with `new` and `ImageSource`), `list_cameras`,
+//! `initialize`, `is_authorized` and `probe`; the shared parts are here.
 
-use std::error::Error;
+use std::time::Duration;
 
-use nokhwa::{
-    Camera,
-    pixel_format::RgbAFormat,
-    query,
-    utils::{ApiBackend, CameraFormat, RequestedFormat, RequestedFormatType, Resolution},
-};
+#[cfg(target_os = "macos")]
+mod avfoundation;
+#[cfg(target_os = "linux")]
+mod v4l;
 
-use crate::{ImageSource, VideoFrame};
+#[cfg(target_os = "macos")]
+pub use avfoundation::{CameraSource, initialize, is_authorized, list_cameras, probe};
+#[cfg(target_os = "linux")]
+pub use v4l::{CameraSource, initialize, is_authorized, list_cameras, probe};
 
-/// Print all cameras with their supported formats, one line per format.
-///
-/// On Linux the user must be in the `video` group, see the README.
-pub fn probe() -> Result<(), Box<dyn Error>> {
-    let cameras = query(ApiBackend::Auto)?;
-    if cameras.is_empty() {
-        println!("no cameras found");
-    }
-
-    for info in cameras {
-        println!(
-            "{} {} ({})",
-            info.index(),
-            info.human_name(),
-            info.description()
-        );
-
-        // Formats can only be queried from an opened camera
-        let format = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None);
-        match Camera::new(info.index().clone(), format)
-            .and_then(|mut camera| camera.compatible_camera_formats())
-        {
-            Ok(formats) => {
-                for f in formats {
-                    println!("    {f}");
-                }
-            }
-            Err(e) => println!("    error getting formats: {e}"),
-        }
-    }
-    Ok(())
+#[derive(Debug, thiserror::Error)]
+pub enum VideoError {
+    #[error("no camera with {0:?} in its name")]
+    NotFound(String),
+    #[error("no camera with index {0}")]
+    NoSuchIndex(u32),
+    #[error("camera access not granted (macOS: System Settings, Privacy & Security, Camera)")]
+    NotAuthorized,
+    #[cfg(target_os = "linux")]
+    #[error("camera: {0}")]
+    Camera(#[from] nokhwa::NokhwaError),
+    /// Error reported by AVFoundation, e.g. from `NSError`
+    #[cfg(target_os = "macos")]
+    #[error("camera: {0}")]
+    Camera(String),
+    #[error("no camera frame for {} s", .0.as_secs_f64())]
+    NoFrame(Duration),
+    #[error("camera stream closed")]
+    Closed,
 }
 
-/// Live camera capture, frames converted to RGBA
-pub struct CameraSource {
-    camera: Camera,
+/// A camera as listed by the OS
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraEntry {
+    /// V4L2: N of `/dev/videoN`; AVFoundation: position in the device list
+    pub index: u32,
+    pub name: String,
 }
 
 impl CameraSource {
-    /// Open camera `index` (see [`probe`]) and start streaming.
-    pub fn new(index: u32) -> Result<Self, Box<dyn Error>> {
-        let format = RequestedFormatType::Exact(CameraFormat::new(
-            Resolution::new(1920, 1080),
-            nokhwa::utils::FrameFormat::MJPEG,
-            60,
-        ));
+    /// Open the first camera whose name contains `name` (case-insensitive) and that streams the
+    /// requested format, see `CameraSource::new`.
+    ///
+    /// One camera can show up as several devices (e.g. a V4L2 metadata node that cannot
+    /// stream), so all matches are tried in order. Unlike the index, the name survives replugging.
+    /// Returns the error of the last match that failed, or `NotFound` if none matched.
+    pub fn open_by_name(name: &str, width: u32, height: u32, fps: u32) -> Result<Self, VideoError> {
+        let lower = name.to_lowercase();
+        let mut last_error = None;
 
-        let mut camera = Camera::new(
-            nokhwa::utils::CameraIndex::Index(index),
-            RequestedFormat::new::<RgbAFormat>(format),
-        )?;
-        camera.open_stream()?;
-
-        Ok(Self { camera })
-    }
-}
-
-impl ImageSource for CameraSource {
-    fn next_frame(&mut self) -> Option<VideoFrame> {
-        let frame = match self.camera.frame() {
-            Ok(frame) => frame,
-            Err(e) => {
-                eprintln!("camera frame: {e}");
-                return None;
+        for entry in list_cameras()? {
+            if !entry.name.to_lowercase().contains(&lower) {
+                continue;
             }
-        };
+            match Self::new(entry.index, width, height, fps) {
+                Ok(camera) => return Ok(camera),
+                Err(e) => last_error = Some(e),
+            }
+        }
 
-        let image = frame.decode_image::<RgbAFormat>().ok()?;
-
-        Some(VideoFrame {
-            width: image.width(),
-            height: image.height(),
-            pixels: image.into_raw(),
-        })
+        Err(last_error.unwrap_or_else(|| VideoError::NotFound(name.to_string())))
     }
 }

@@ -1,5 +1,6 @@
 pub mod dsp;
 pub mod geometry;
+pub mod peaks;
 pub mod pipeline;
 pub mod render;
 pub mod source;
@@ -29,8 +30,14 @@ pub trait FrameSource<const M: usize> {
 }
 
 pub trait ImageSource {
-    fn next_frame(&mut self) -> Option<VideoFrame>;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Blocks until the next frame is available.
+    fn next_frame(&mut self) -> Result<VideoFrame, Self::Error>;
 }
+
+/// Boxed error for caller-defined parts (e.g. map handlers); `Send + Sync` to cross threads
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct VideoFrame {
     pub width: u32,

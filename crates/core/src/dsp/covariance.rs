@@ -55,11 +55,64 @@ impl<const M: usize> Covariance<M> {
     }
 }
 
+/// Exponentially weighted covariance for live maps: R_est <- R_est + w (x x^H - R_est) per frame.
+///
+/// `w = max(1 - alpha, 1/l)` for frame l = 1, 2, ...: the plain mean while l < 1/(1 - alpha)
+/// (no start-up bias toward zero), then the exponential average with memory of about
+/// 1/(1 - alpha) frames. Never reset; a map can be computed after any frame.
+pub struct SlidingCovariance<const M: usize> {
+    estimate: Vec<SMatrix<Complex64, M, M>>,
+    /// Forgetting factor in [0, 1)
+    alpha: f64,
+    count: usize,
+}
+
+impl<const M: usize> SlidingCovariance<M> {
+    /// - `n_bins`: usually fft_len / 2 + 1
+    /// - `memory`: effective window in frames, alpha = 1 - 1/memory
+    pub fn new(n_bins: usize, memory: usize) -> Self {
+        assert!(memory > 0, "memory must be at least one frame");
+        Self {
+            estimate: vec![SMatrix::zeros(); n_bins],
+            alpha: 1.0 - 1.0 / memory as f64,
+            count: 0,
+        }
+    }
+
+    pub fn accumulate(&mut self, snapshots: &[SVector<Complex64, M>]) {
+        // zip would stop at the shorter iterator, which would be hard to catch
+        assert_eq!(
+            snapshots.len(),
+            self.estimate.len(),
+            "snapshot bin count must match"
+        );
+
+        self.count += 1;
+        let w = (1.0 - self.alpha).max(1.0 / self.count as f64);
+        for (r, x) in self.estimate.iter_mut().zip(snapshots) {
+            *r += (x * x.adjoint() - *r).scale(w);
+        }
+    }
+
+    /// Frames accumulated so far
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Current R_est per bin
+    ///
+    /// Panics if no frame was accumulated yet
+    pub fn estimate(&self) -> &[SMatrix<Complex64, M, M>] {
+        assert!(self.count > 0, "Count must be >0");
+        &self.estimate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nalgebra::SVector;
 
-    use super::Covariance;
+    use super::{Covariance, SlidingCovariance};
     use crate::Complex64;
 
     const M: usize = 3;
@@ -139,5 +192,47 @@ mod tests {
     #[should_panic]
     fn wrong_bin_count_panics() {
         Covariance::<M>::new(N_BINS + 1).accumulate(&snapshots(1.0));
+    }
+
+    /// Within the memory the sliding estimate is the plain mean, like `Covariance`
+    #[test]
+    fn sliding_equals_mean_during_start() {
+        let mut plain = Covariance::<M>::new(N_BINS);
+        let mut sliding = SlidingCovariance::<M>::new(N_BINS, 10);
+        for seed in [0.3, -1.7, 2.5] {
+            plain.accumulate(&snapshots(seed));
+            sliding.accumulate(&snapshots(seed));
+        }
+
+        for (k, (p, s)) in plain.estimate().iter().zip(sliding.estimate()).enumerate() {
+            assert!((p - s).norm() < 1e-12, "bin {k}");
+        }
+    }
+
+    /// After a change of input, old frames decay: the estimate converges to the new x x^H
+    #[test]
+    fn sliding_forgets_old_frames() {
+        let x = snapshots(1.0);
+        let y = snapshots(-2.0);
+        let mut cov = SlidingCovariance::<M>::new(N_BINS, 10);
+        for _ in 0..10 {
+            cov.accumulate(&x);
+        }
+        // Weight of the x frames after 200 y frames: 0.9^200 ~ 7e-10
+        for _ in 0..200 {
+            cov.accumulate(&y);
+        }
+
+        for k in 0..N_BINS {
+            let target = y[k] * y[k].adjoint();
+            let error = (cov.estimate()[k] - target).norm() / target.norm();
+            assert!(error < 1e-8, "bin {k}: relative error {error}");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn sliding_estimate_without_frames_panics() {
+        SlidingCovariance::<M>::new(N_BINS, 10).estimate();
     }
 }
