@@ -1,5 +1,6 @@
 pub mod dsp;
 pub mod geometry;
+pub mod peaks;
 pub mod pipeline;
 pub mod render;
 pub mod source;

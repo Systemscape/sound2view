@@ -6,6 +6,7 @@ use std::{error::Error, fs, io};
 use serde::Deserialize;
 use sound2view_core::{
     geometry::camera::{Camera, Intrinsics, Mount},
+    peaks::PeakConfig,
     pipeline::PipelineConfig,
 };
 
@@ -20,6 +21,7 @@ pub struct Config {
     pub pipeline: PipelineConfig,
     pub beamformer: BeamformerConfig,
     pub display: DisplayConfig,
+    pub peaks: PeakConfig,
 }
 
 impl Config {
@@ -154,6 +156,26 @@ impl Method {
             Method::CleanSc => "CLEAN-SC",
         }
     }
+
+    /// What the method does, for tooltips
+    pub fn description(self) -> &'static str {
+        match self {
+            Method::Das => {
+                "Delay and sum: the classic beamformer. Robust, but wide source zones, and \
+                 sidelobes only about 13 dB below the source (small 4x4 array)."
+            }
+            Method::Functional => {
+                "Functional beamforming: delay and sum with the covariance raised to 1/nu and \
+                 the result to nu. Much sharper sources and weaker sidelobes; at large nu \
+                 sensitive to model errors."
+            }
+            Method::CleanSc => {
+                "CLEAN-SC: finds the strongest source, removes everything coherent with it from \
+                 the measurement and repeats. Point-like sources (drawn with a small blur); \
+                 reflections can show up as extra sources."
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -163,6 +185,10 @@ pub struct BeamformerConfig {
     /// Exponent nu of functional beamforming; larger is sharper but more sensitive to model
     /// errors
     pub nu: f64,
+    /// Functional: subtract the median eigenvalue (noise estimate) per bin
+    pub functional_noise_removal: bool,
+    /// Functional: normalize each bin's map before summing, so low bins do not dominate
+    pub functional_equal_bins: bool,
     /// CLEAN-SC loop gain in (0, 1]
     pub clean_gain: f64,
     /// CLEAN-SC: maximum number of removed sources per frequency bin
@@ -178,6 +204,8 @@ impl Default for BeamformerConfig {
         Self {
             method: Method::Functional,
             nu: 20.0,
+            functional_noise_removal: true,
+            functional_equal_bins: true,
             clean_gain: 0.9,
             clean_max_iter: 10,
             clean_stop_db: 20.0,
@@ -230,6 +258,12 @@ impl Config {
             if !c.dist.iter().all(|k| k.is_finite()) {
                 return Err("camera.calibration: dist must be finite".to_string());
             }
+        }
+        let p = &self.peaks;
+        if p.range_db <= 0.0 || p.min_dist_cells < 0.0 || p.max_count == 0 {
+            return Err(
+                "peaks: range_db must be > 0, min_dist_cells >= 0, max_count >= 1".to_string(),
+            );
         }
         if self.display.db_range <= 0.0 {
             return Err("display.db_range must be > 0".to_string());

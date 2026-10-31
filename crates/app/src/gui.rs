@@ -10,10 +10,11 @@ use std::{
 
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, Rect, RichText, Slider,
-    TextureHandle, TextureOptions, pos2,
+    Stroke, TextureHandle, TextureOptions, pos2,
 };
 use sound2view_core::{
     BoxError, ImageSource, VideoFrame,
+    peaks::{Peak, PeakConfig, find_peaks},
     pipeline::{MapLayout, PipelineConfig},
     render,
     source::{
@@ -88,6 +89,25 @@ const CAMERA_MAX_FAILED_FRAMES: usize = 10;
 /// Font size of the camera status text on the image
 const STATUS_FONT_SIZE: f32 = 28.0;
 
+/// Tooltips of the controls, shown on the label and the control
+const NU_HELP: &str = "Exponent of functional beamforming. Larger values make sources sharper \
+    and suppress sidelobes, but also amplify model errors (uncalibrated mics, wrong focus \
+    distance): a source can then fade or split. 1 is delay and sum.";
+const NOISE_REMOVAL_HELP: &str = "Subtracts an estimate of the uncorrelated noise (mic \
+    self-noise, diffuse room sound) in every frequency bin before beamforming. Without it, \
+    noise widens the source zones. Assumes fewer than 8 sources per bin.";
+const EQUAL_BINS_HELP: &str = "Gives every frequency bin the same weight. Otherwise the low \
+    bins, where speech has most of its energy but the array has almost no resolution, dominate \
+    and the zones get wide. Bins more than 20 dB below the strongest are left out.";
+const BAND_HELP: &str = "Frequency range summed into the map. Lower frequencies give wider \
+    zones (the array is only 12.6 cm wide); above about 4 kHz ghost sources (grating lobes) can \
+    appear. For a single tone, narrow the band around it.";
+const OVERLAY_HELP: &str = "Dynamic range of the overlay: everything more than this many dB \
+    below the loudest point is transparent. Smaller values show only the strongest sources.";
+/// Radius of the dot per estimated source in screen points, and size of its level label
+const PEAK_RADIUS: f32 = 7.0;
+const PEAK_FONT_SIZE: f32 = 14.0;
+
 /// Slider limits
 const NU_RANGE: RangeInclusive<f64> = 1.0..=100.0;
 const CLEAN_MAX_ITER_RANGE: RangeInclusive<usize> = 1..=30;
@@ -121,6 +141,10 @@ pub struct App {
     last_map: Option<MapData>,
     /// Overlay range in dB below the map maximum; applies immediately
     db_range: f64,
+    /// Peak search; `enabled` is toggled in the GUI
+    peaks: PeakConfig,
+    /// Peaks of `last_map`
+    found_peaks: Vec<Peak>,
     /// Settings edited in the GUI
     settings: PipelineSettings,
     /// Settings read by the audio thread; updated from `settings` when no slider is dragged
@@ -189,6 +213,7 @@ impl eframe::App for App {
         }
 
         if redraw_map && let Some(map) = &self.last_map {
+            self.found_peaks = find_peaks(&map.power, map.size, &self.peaks);
             let rgba = render::map_rgba(&map.power, self.db_range);
             let image = ColorImage::from_rgba_unmultiplied(map.size, &rgba);
             // Linear filtering interpolates the coarse grid smoothly to the image size
@@ -236,6 +261,11 @@ impl eframe::App for App {
                     && let Some(map_texture) = &self.map_texture
                 {
                     painter.image(map_texture.id(), rect, uv, Color32::WHITE);
+                    if self.peaks.enabled
+                        && let Some(map) = &self.last_map
+                    {
+                        draw_peaks(painter, rect, map.size, &self.found_peaks);
+                    }
                 }
 
                 // The last frame stays visible but dimmed while the camera is not streaming
@@ -285,6 +315,8 @@ impl App {
             map_texture: None,
             last_map: None,
             db_range: config.display.db_range,
+            peaks: config.peaks.clone(),
+            found_peaks: Vec::new(),
             settings,
             shared_settings,
             camera,
@@ -311,7 +343,11 @@ impl App {
         };
 
         let mut choice = current.clone();
-        label(ui, "Camera");
+        label(ui, "Camera").on_hover_text(format!(
+            "Auto opens the first camera whose name contains \"{}\" (camera.name). The overlay \
+             only lines up with cameras that match the configured field of view or calibration.",
+            self.camera_name
+        ));
         egui::ComboBox::from_id_salt("camera")
             .selected_text(selected_text)
             .width(CAMERA_COMBO_WIDTH)
@@ -329,47 +365,61 @@ impl App {
         }
     }
 
-    /// Beamformer and its parameter, band and overlay range; returns true if the overlay needs a
-    /// redraw
+    /// Beamformer and its parameters, band, overlay range and peak toggle; returns true if the
+    /// overlay needs a redraw
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         let beamformer = &mut self.settings.beamformer;
         let pipeline = &mut self.settings.pipeline;
 
-        label(ui, "Beamformer");
+        let method_help = beamformer.method.description();
+        label(ui, "Beamformer").on_hover_text(method_help);
         egui::ComboBox::from_id_salt("method")
             .selected_text(beamformer.method.label())
             .show_ui(ui, |ui| {
                 for method in Method::ALL {
-                    ui.selectable_value(&mut beamformer.method, method, method.label());
+                    ui.selectable_value(&mut beamformer.method, method, method.label())
+                        .on_hover_text(method.description());
                 }
-            });
+            })
+            .response
+            .on_hover_text(method_help);
 
         // Parameter of the selected method
         match beamformer.method {
             Method::Das => {}
             Method::Functional => {
                 ui.add_space(16.0);
-                label(ui, "nu");
+                label(ui, "nu").on_hover_text(NU_HELP);
                 ui.add(
                     Slider::new(&mut beamformer.nu, NU_RANGE)
                         .logarithmic(true)
                         .max_decimals(0),
                 )
-                .on_hover_text("Exponent of functional beamforming: larger is sharper");
+                .on_hover_text(NU_HELP);
+                ui.checkbox(&mut beamformer.functional_noise_removal, "Noise removal")
+                    .on_hover_text(NOISE_REMOVAL_HELP);
+                ui.checkbox(&mut beamformer.functional_equal_bins, "Equal bins")
+                    .on_hover_text(EQUAL_BINS_HELP);
             }
             Method::CleanSc => {
                 ui.add_space(16.0);
-                label(ui, "Sources");
+                let sources_help = format!(
+                    "At most this many sources are removed per frequency bin. More finds weaker \
+                     sources, but also more reflections. Bins whose strongest point is more than \
+                     {} dB below the strongest bin add nothing.",
+                    beamformer.clean_stop_db
+                );
+                label(ui, "Sources").on_hover_text(&sources_help);
                 ui.add(Slider::new(
                     &mut beamformer.clean_max_iter,
                     CLEAN_MAX_ITER_RANGE,
                 ))
-                .on_hover_text("Maximum number of sources removed per frequency bin");
+                .on_hover_text(sources_help);
             }
         }
 
         ui.add_space(16.0);
-        label(ui, "Band");
+        label(ui, "Band").on_hover_text(BAND_HELP);
         // Each end is limited by the other, so the band never collapses
         ui.add(
             Slider::new(
@@ -379,7 +429,8 @@ impl App {
             .logarithmic(true)
             .suffix(" Hz")
             .max_decimals(0),
-        );
+        )
+        .on_hover_text(BAND_HELP);
         ui.add(
             Slider::new(
                 &mut pipeline.f_hi_hz,
@@ -388,23 +439,59 @@ impl App {
             .logarithmic(true)
             .suffix(" Hz")
             .max_decimals(0),
-        );
+        )
+        .on_hover_text(BAND_HELP);
 
         ui.add_space(16.0);
-        label(ui, "Overlay");
-        ui.add(
-            Slider::new(&mut self.db_range, DB_RANGE_RANGE)
-                .suffix(" dB")
-                .max_decimals(1),
-        )
-        .on_hover_text("Range below the map maximum that is shown")
-        .changed()
+        label(ui, "Overlay").on_hover_text(OVERLAY_HELP);
+        let db_range_changed = ui
+            .add(
+                Slider::new(&mut self.db_range, DB_RANGE_RANGE)
+                    .suffix(" dB")
+                    .max_decimals(1),
+            )
+            .on_hover_text(OVERLAY_HELP)
+            .changed();
+
+        ui.add_space(16.0);
+        ui.checkbox(&mut self.peaks.enabled, "Peaks")
+            .on_hover_text(format!(
+                "Blue dots at the estimated source positions: local maxima of the map within {} \
+                 dB of the loudest point, at least {} grid cells apart, at most {}. The label is \
+                 the level relative to the loudest point.",
+                self.peaks.range_db, self.peaks.min_dist_cells, self.peaks.max_count
+            ));
+        db_range_changed
+    }
+}
+
+/// Dot with level label per peak; `rect` is where the map is drawn, `size` its grid size
+fn draw_peaks(painter: &egui::Painter, rect: Rect, [width, height]: [usize; 2], peaks: &[Peak]) {
+    let font = FontId::proportional(PEAK_FONT_SIZE);
+    for peak in peaks {
+        // Grid cell centers at (col + 0.5) / width of the image
+        let x = rect.left() + (peak.col as f32 + 0.5) / width as f32 * rect.width();
+        let y = rect.top() + (peak.row as f32 + 0.5) / height as f32 * rect.height();
+        let center = pos2(x, y);
+        painter.circle(
+            center,
+            PEAK_RADIUS,
+            theme::PEAK,
+            Stroke::new(2.0, Color32::WHITE),
+        );
+        painter.text(
+            pos2(x + PEAK_RADIUS + 4.0, y),
+            Align2::LEFT_CENTER,
+            format!("{:.1} dB", peak.level_db),
+            font.clone(),
+            Color32::WHITE,
+        );
     }
 }
 
 /// Muted label in front of a control
-fn label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(theme::TEXT_WEAK));
+fn label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(RichText::new(text).color(theme::TEXT_WEAK))
 }
 
 /// Set `status` and repaint, so the GUI shows it without waiting for the next frame

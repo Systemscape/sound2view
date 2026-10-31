@@ -5,16 +5,25 @@ use image::{
     imageops::{self, FilterType},
 };
 
-use crate::{Point3, pipeline::MapLayout};
+use crate::{Point3, peaks::Peak, pipeline::MapLayout};
 
 /// Marker half length in camera pixels
 const MARKER_HALF_LEN: i64 = 10;
+/// Radius of the dot per estimated source in camera pixels
+const PEAK_RADIUS: i64 = 8;
 
-/// Power map as image at camera resolution, with a cross per true source.
+/// Power map as image at camera resolution, with a red cross per true source and a blue dot per
+/// peak.
 ///
 /// - `power`: row-major like the scan grid, `grid_width * grid_height` values
 /// - `src_pos`: true source positions, array frame
-pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbImage {
+/// - `peaks`: estimated sources in grid cells, see [`crate::peaks::find_peaks`]
+pub fn map_image(
+    power: &[f64],
+    layout: &MapLayout,
+    src_pos: &[Point3],
+    peaks: &[Peak],
+) -> RgbImage {
     // One grid pixel per map value; x = col, y = row, same as `power[row * w + col]`
     let w = layout.grid_width;
     let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -30,6 +39,24 @@ pub fn map_image(power: &[f64], layout: &MapLayout, src_pos: &[Point3]) -> RgbIm
         intrinsics.height,
         FilterType::Nearest,
     );
+
+    // Grid cell centers to camera pixel centers, as `Intrinsics::scaled`
+    let s_x = intrinsics.width as f64 / layout.grid_width as f64;
+    let s_y = intrinsics.height as f64 / layout.grid_height as f64;
+    for peak in peaks {
+        let u = ((peak.col + 0.5) * s_x - 0.5).round() as i64;
+        let v = ((peak.row + 0.5) * s_y - 0.5).round() as i64;
+        for dy in -PEAK_RADIUS..=PEAK_RADIUS {
+            for dx in -PEAK_RADIUS..=PEAK_RADIUS {
+                let (x, y) = (u + dx, v + dy);
+                let inside =
+                    (0..big.width() as i64).contains(&x) && (0..big.height() as i64).contains(&y);
+                if dx * dx + dy * dy <= PEAK_RADIUS * PEAK_RADIUS && inside {
+                    big.put_pixel(x as u32, y as u32, Rgb([40, 120, 255]));
+                }
+            }
+        }
+    }
 
     for pos in src_pos {
         // `project` panics behind the camera

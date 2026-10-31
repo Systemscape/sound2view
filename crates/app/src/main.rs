@@ -14,6 +14,7 @@ use sound2view_core::{
         Normalization, clean_sc::CleanSc, delay_and_sum::Das, functional::Functional,
     },
     geometry::mic_array::MicArray,
+    peaks::{PeakConfig, find_peaks},
     pipeline::{MapLayout, Pipeline, PipelineError, run},
     render,
     source::{
@@ -112,7 +113,8 @@ fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     let sample_rate = scene.sample_rate;
     let mut sim = Simulator::new(scene, MicArray::uma16())?;
 
-    run_configured(&mut sim, sample_rate, config, save_maps(src_pos, None))?;
+    let on_map = save_maps(src_pos, None, config.peaks.clone());
+    run_configured(&mut sim, sample_rate, config, on_map)?;
     Ok(())
 }
 
@@ -129,7 +131,7 @@ fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
         &mut mic,
         sample_rate,
         config,
-        save_maps(Vec::new(), Some(MIC_MAPS)),
+        save_maps(Vec::new(), Some(MIC_MAPS), config.peaks.clone()),
     )?;
 
     println!("dropped {} chunks", mic.dropped());
@@ -158,7 +160,12 @@ fn run_configured<S: FrameSource<16>>(
         }
         Method::Functional => {
             let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
-                Functional::new(steering, b.nu)
+                Functional::new(
+                    steering,
+                    b.nu,
+                    b.functional_noise_removal,
+                    b.functional_equal_bins,
+                )
             })?;
             run(source, pipeline, on_map)
         }
@@ -170,6 +177,7 @@ fn run_configured<S: FrameSource<16>>(
                     b.clean_max_iter,
                     b.clean_stop_db,
                     b.clean_beam_cells,
+                    true,
                 )
             })?;
             run(source, pipeline, on_map)
@@ -177,16 +185,23 @@ fn run_configured<S: FrameSource<16>>(
     }
 }
 
-/// Map handler for `run`: writes each map as `map_NNN.png` with a marker per `src_pos`.
+/// Map handler for `run`: writes each map as `map_NNN.png` with a red cross per `src_pos` and a
+/// blue dot per peak (if `peaks.enabled`).
 ///
 /// Stops after `max_maps` maps; `None` runs until the stream ends.
 fn save_maps(
     src_pos: Vec<Point3>,
     max_maps: Option<usize>,
+    peaks: PeakConfig,
 ) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError> {
     let mut i = 0;
     move |power, layout| {
-        render::map_image(power, layout, &src_pos).save(format!("map_{i:03}.png"))?;
+        let found = if peaks.enabled {
+            find_peaks(power, [layout.grid_width, layout.grid_height], &peaks)
+        } else {
+            Vec::new()
+        };
+        render::map_image(power, layout, &src_pos, &found).save(format!("map_{i:03}.png"))?;
         i += 1;
         if max_maps.is_some_and(|max| i >= max) {
             Ok(ControlFlow::Break(()))
