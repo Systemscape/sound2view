@@ -13,11 +13,18 @@ rand = { version = "0.10.3", features = ["chacha"] }
 rand_distr = "0.6.0"
 realfft = "3.5.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
-toml = { version = "1.1.8+spec-1.1.0", default-features = false, features = ["std", "serde", "parse"] }
+toml = { version = "1.1.8", default-features = false, features = ["std", "serde", "parse"] }
 
 # Camera backend per platform
 [target.'cfg(target_os = "linux")'.dependencies]
 nokhwa = { version = "0.10.11", features = ["input-v4l"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nokhwa = { version = "0.10.11", features = ["input-avfoundation"] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.5"
+objc2-av-foundation = { version = "0.3.2", features = ["block2", "dispatch2", "objc2-core-media", "objc2-core-video"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-media = { version = "0.3.2", features = ["objc2-core-video"] }
+objc2-core-video = "0.3.2"
+objc2-foundation = "0.3.2"

@@ -44,7 +44,10 @@ pub trait FrameSource<const M: usize> {
     fn read(&mut self, buf: &mut [f64]) -> std::io::Result<usize>;
 }
 
-pub trait ImageSource { fn next_frame(&mut self) -> Option<VideoFrame>; }
+pub trait ImageSource {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn next_frame(&mut self) -> Result<VideoFrame, Self::Error>;
+}
 
 pub struct VideoFrame {
     pub width: u32,
@@ -74,7 +77,7 @@ Module layout of `crates/core/src` (`foo.rs` + `foo/` style, no `mod.rs`); `main
 src/
   lib.rs, pipeline.rs, render.rs, test_util.rs
   geometry/   camera, mic_array, scan_grid
-  source/     capture, simulator/ (scene, signal, reference)
+  source/     capture, simulator/ (scene, signal, reference), video/ (v4l on Linux, avfoundation on macOS)
   dsp/        stft, covariance, beamformer/ (delay_and_sum, functional, clean_sc)
 ```
 
@@ -84,7 +87,8 @@ Dependencies point one way: `geometry` ← `dsp` ← `pipeline` → `render`; `s
   - `run_configured(&mut source, sample_rate, &config, on_map) -> Result<(), PipelineError>`: builds the `Pipeline` with `config.pipeline`, `config.camera.camera()` and the configured beamformer (`match` on `Method`: `Das::new(.., true, TrueLocation)`, `Functional::new(.., nu)` or `CleanSc::new(.., clean_gain, clean_max_iter, clean_stop_db, clean_beam_cells)`), then `run`. One `run` instantiation per method. Used by CLI and GUI; the CLI also uses the configured method (default functional). Core errors convert into `main`'s `Box<dyn Error>` with plain `?`.
 - `config.rs` (app): `Config { audio, camera, pipeline: PipelineConfig (core), beamformer, display }`, serde with `#[serde(default, deny_unknown_fields)]` everywhere: file, sections and entries optional, typos are errors. `Config::load(path)`: missing file → defaults (prints a note). `AudioConfig { device, sample_rate }`, `CameraConfig { name, width, height, fps, hfov_deg }` + `camera()` (pinhole via `from_hfov`, default `Mount`), `Method` (`das`/`functional`, `ALL`, `label`), `BeamformerConfig { method, nu }`, `DisplayConfig { db_range }`. Example with all defaults: `sound2view.toml` in the root.
 - `gui.rs` (eframe 0.37: `App::ui(&mut self, ui, frame)`, panels via `egui::Panel::top(..).show(ui, ..)` and `CentralPanel::default().show(ui, ..)`; `show_inside` is deprecated). `sound2view gui`, window starts maximized (`ViewportBuilder::with_maximized`). `App::new(cc, config)`.
-  - Camera thread (`spawn_camera`): `CameraSource::open_by_name` with the `CameraConfig` inside the thread, `sync_channel(1)` + `try_send` (drops frames), `request_repaint` per frame. Retries opening every 2 s (`RETRY`, polling), reopens after 10 consecutive frame errors (`CAMERA_MAX_FAILED_FRAMES`, e.g. unplugged).
+  - Camera thread (`spawn_camera`): opens the camera selected in the GUI (`CameraChoice::Auto` = `CameraSource::open_by_name(camera.name)`, or `CameraChoice::Index(i)` = `CameraSource::new(i)`) inside the thread, `sync_channel(1)` + `try_send` (drops frames), `request_repaint` per frame. Refreshes `list_cameras()` on every open attempt (also while missing, so plugged-in cameras show up). Reopens immediately when the selection changes (old camera dropped first), retries every 2 s (`RETRY`; `wait_for_other_choice` polls the selection every 100 ms meanwhile), reopens after 10 consecutive frame errors (`CAMERA_MAX_FAILED_FRAMES`).
+  - `CameraShared { choice: Mutex<CameraChoice>, status: Mutex<DeviceStatus>, cameras: Mutex<Vec<CameraEntry>> }` in an `Arc`, shared by GUI and camera thread. `camera_control()` in the top bar: "Camera" `ComboBox` with "Auto (<camera.name>)" plus every listed camera as "name (index)"; a change sets the choice and status `Opening`. Unfiltered: on Linux the icspring metadata node is listed too (selecting it shows the open error). `hfov_deg` belongs to the configured camera; other cameras only fit the overlay with the same field of view.
   - `DeviceStatus` (`Opening`, `Missing(error)`, `Running`, `Lost(error)`) for camera and mic, each in an `Arc<Mutex<..>>`, set by its thread via `set_status` (with `request_repaint`). Top bar: dot + short text per device, full message as tooltip. Camera message centered over the dimmed last frame (or alone before the first frame); the map overlay is hidden while the mic is not `Running` (stale map).
   - Audio thread (`spawn_audio`): outer loop opens the mic (`Missing` + retry every 2 s on failure). Inner loop: read `PipelineSettings { beamformer, pipeline }` from an `Arc<Mutex<..>>`, put them into its `Config` copy, `run_configured`. `on_map` sends `MapData { size, power }` (raw power), returns `Break` when the settings changed (restart with the mic kept open, ALSA `hw:` is exclusive) or the GUI closed (thread ends). A pipeline error (e.g. mic unplugged: `CaptureError` via the source) drops the mic, sets `Lost(error)` and reopens after 2 s.
   - `theme.rs` (app): dark theme applied in `App::new` (`theme::apply`, forces `Theme::Dark`, `all_styles_mut`). Palette constants: `BACKGROUND` #0f1113 (behind the image), `PANEL` #181b1f (top bar), `TEXT`, `TEXT_WEAK`, `ACCENT` amber #f5a524 (matches the overlay), `OK`, `ERROR`; 6 px radius, larger text (body 15) and padding.
@@ -102,6 +106,9 @@ Dependencies point one way: `geometry` ← `dsp` ← `pipeline` → `render`; `s
   - Measured: chunks ≈ 180 frames (≈ 4 ms), queue ≈ 0.25 s. Release keeps up, 0 dropped.
   - Threads, not async: cpal owns the audio thread, the channel is the boundary. With egui: worker thread runs `run` and sends maps to the GUI thread (`try_recv` per frame or `Arc<Mutex<latest map>>`).
 
+- `source/video.rs` (+ `video/v4l.rs`, `video/avfoundation.rs`): camera capture behind the same API on both platforms, backend chosen with `#[cfg(target_os)]` (`pub use` of `CameraSource`, `list_cameras`, `initialize`, `is_authorized`, `probe`). Shared: `VideoError` (`NotFound(name)`, `NoSuchIndex`, `NotAuthorized`, `Camera` (Linux: `NokhwaError`, macOS: `String` from `NSError`), `NoFrame(Duration)`, `Closed`), `CameraEntry { index, name }`, `CameraSource::open_by_name` (case-insensitive substring, tries every match in order).
+  - `v4l.rs` (Linux): nokhwa 0.10 with V4L2. `new(index = /dev/videoN, w, h, fps)`: MJPEG `Exact`, else `Closest`; RGBA via nokhwa's decoder. `initialize` no-op, `is_authorized` always true (`video` group, see README). `probe` opens each camera to list its formats.
+  - `avfoundation.rs` (macOS): own backend on objc2 (nokhwa's AVFoundation bindings are broken, see the macOS section). `devices()` = `AVCaptureDeviceDiscoverySession` with `AVCaptureDeviceTypeExternal` (macOS 14+) and `BuiltInWideAngleCamera`; index = position in that list, name = `localizedName`. `new`: pick the (format, frame rate range) pair closest to the request (resolution mismatch in pixels first, then fps outside the range; `FormatOption::distance`), so format and frame rate always come from the same entry; `AVCaptureSession` + `AVCaptureDeviceInput` + `AVCaptureVideoDataOutput` with `videoSettings` = 32BGRA (AVFoundation converts MJPEG/YUV), `setActiveFormat` and min = max frame duration (`frame_duration`: the range's own CMTime at its ends, else 1/fps) under `lockForConfiguration` inside begin/commitConfiguration, then `startRunning`. Delegate `FrameDelegate` (`define_class!`, ivars = `SyncSender<VideoFrame>`) on a serial dispatch queue: `to_rgba` locks the CVPixelBuffer, copies BGRA → RGBA row by row (stride), `try_send` (drops while the reader is behind). `next_frame` = `recv_timeout(2 s)`. `Drop` stops the session. `initialize` = `requestAccessForMediaType`, `is_authorized` = `authorizationStatusForMediaType == Authorized`. `probe` lists devices with every format and fps range (`1920x1080 @ 5-30 FPS, 420v`) without opening a session. Everything that returns autoreleased objects runs in `autoreleasepool`.
 - `lib.rs`: `Vector3 = nalgebra::Vector3<f64>`, `Point3 = nalgebra::Point3<f64>`, `Complex64 = nalgebra::Complex<f64>` (same type as `realfft::num_complex::Complex<f64>`, single num-complex 0.4 in the lock file), `C_SOUND = 343.0` (TODO: rename to `SPEED_OF_SOUND`), `distance_to_delay(d) = d / C_SOUND`, the traits above.
 - `geometry/mic_array.rs`: `pub struct MicArray<const M: usize> { pub mic_pos: [Point3; M] }`, indexed by USB channel.
   - `uniform_rect(cols, rows, pitch_x, pitch_y, channel_of: impl Fn(row, col) -> usize)`: asserts `rows * cols == M` and each channel assigned once. Row 0 = top = +y, col 0 = left = −x, viewed from the sound-source side (z into the scene).
@@ -167,7 +174,7 @@ Dependencies point one way: `geometry` ← `dsp` ← `pipeline` → `render`; `s
   - `one_sine_no_noise`: bin-center sine, R̂ = R to 1e-9 for every L (frame phase cancels in x xᴴ; image is exactly 0 near the bin).
   - `one_sine_with_mic_noise`: 110 dB mic noise (σ² ≈ 40 Pa² vs ≈ 150 Pa² sine in bin 50), 0.5 s vs 2 s; error ratio ≈ √(L_long/L_short) ± 0.5. Detects bias in R (error floor → ratio → 1); verified by dropping σ² → σ. Expected size ≈ √(M/L) for noise alone. Avoid 94 dB (σ = 1 Pa, σ = σ²).
 - `test_util.rs` (`#[cfg(test)] pub(crate)`): `SAMPLE_RATE` 48 kHz, `FFT_LEN` 1000, `BIN` 50, `F_SINE` = bin center (2400 Hz), `test_pos()` (0.1, 0.2, 1.0), `test_sine()` (A = 1), `test_scene(mic_noise_db, duration_s)`, `read_all(sim, chunk_frames)` (reads to `Ok(0)`), `stream_covariance(scene, mic_array) -> (R̂, L)` (simulator → `StftStream` → `Covariance`), `test_camera()` (1920×1080, 110° HFOV, default mount), `test_scan_grid()` (192 wide, z = 1 m), `sine_bin_power(A, N)` = (A²/2)·N/3. Only helpers used by ≥ 2 modules; module-specific ones stay local. Plain `16`s in tests still to replace.
-- Cargo: `nalgebra` (std, serde-serialize), `serde` (derive), `toml` (std, serde, parse), `rand` 0.10 (chacha), `rand_distr` 0.6, `realfft` 3.5, `cpal` 0.18.2, `image` 0.25 (png only), `nokhwa` 0.10.11, `rayon` 1.12, `thiserror` 2.0. App: `eframe` 0.37, `serde`, `toml`, `image`.
+- Cargo: `nalgebra` (std, serde-serialize), `serde` (derive), `toml` (std, serde, parse), `rand` 0.10 (chacha), `rand_distr` 0.6, `realfft` 3.5, `cpal` 0.18.2, `image` 0.25 (png only), `nokhwa` 0.10.11 (Linux only), macOS only: `objc2` 0.6, `objc2-foundation`/`objc2-av-foundation`/`objc2-core-media`/`objc2-core-video`/`objc2-core-foundation` 0.3, `block2` 0.6, `dispatch2` 0.3; `rayon` 1.12, `thiserror` 2.0. App: `eframe` 0.37, `serde`, `toml`, `image`.
 - `channel_of` is not stored; the mapping is baked into the order of `mic_pos`. Store the inverse `grid_pos` only when needed.
 
 Status: simulator and live UMA-16 both run end to end (source → STFT → R̂ → DAS → PNG). Simulated maps match the markers (sources at z = 2 m on the grid plane, 3.4/3.6 kHz). Live with GUI: camera image plus map overlay; orientation verified (x was flipped, fixed).
@@ -176,7 +183,7 @@ Hardware findings (tone test indoors): a pure tone gives several bright spots. C
 
 Next:
 1. Test on hardware: CLEAN-SC with two incoherent sources, `rayon` speedup (map times), mic unplug/replug (status `Lost` → reconnect), camera unplug/replug.
-1a. macOS (Mac mini): untested. Prepared: platform default audio device, F32 capture, camera access via `video::initialize()` (nokhwa `nokhwa_initialize`, no-op on Linux) and `is_authorized()` (`CameraSource::new` returns `VideoError::NotAuthorized` until granted; CLI camera modes wait up to 10 s, the GUI camera thread retries), MJPEG `Exact` with `Closest` fallback (AVFoundation often lists only NV12/YUYV; a different resolution is printed). README has the macOS permission steps. CI (`.github/workflows/ci.yml`): fmt on Linux, clippy + release tests on ubuntu-latest and macos-latest. Risk: nokhwa's AVFoundation backend is less mature than V4L2.
+1a. macOS: see "macOS (Mac mini): status, continue here" below.
 2. Review the Claude-implemented parts (overlay, sliding covariance, functional, CLEAN-SC, GUI, config, errors).
 3. Camera calibration (principal point, distortion) once the spots are small enough to matter.
 4. Small things: rename the scene `config.toml` → `scene.toml`, "Save" button for GUI settings, deferred tests (diagonal removal, `TrueLocation`), unused `Stft::scale`.
@@ -184,6 +191,29 @@ Next:
 Error handling (thiserror 2 in core): `CaptureError` (capture), `VideoError` (video), `SceneError` (scene), `PipelineError` (pipeline: `InvalidConfig(String)`, `Source(io::Error)`, `MapHandler(BoxError)`). `pub type BoxError = Box<dyn Error + Send + Sync>` in `lib.rs` for caller-defined parts (map handlers). All core errors are `Send + Sync` (worker thread → GUI). `ImageSource { type Error; fn next_frame(&mut self) -> Result<VideoFrame, Self::Error> }`. Config errors are `Result`s: `PipelineConfig::validate(sample_rate)` (called by `Pipeline::new`), app `Config::validate` (called by `Config::load`). Remaining asserts are internal invariants (bin counts, buffer lengths) plus `CleanSc::new`'s parameter ranges (the app validates them first). The probes still return `Box<dyn Error>` (CLI only).
 
 Open: diag-removal tests and a `TrueLocation` hand-built test; unused `Stft::scale`; `DB_RANGE` constant, `FilterType::Triangle`; tests for `max_freq`/`validate`, min r_mk check in `Simulator::new`, `Covariance` doc comments, off-center sine reference test; replace plain `16`s in tests; Unicode in doc comments.
+
+## macOS (Mac mini): status, continue here
+
+Target: the same app on a Mac mini (macOS 14+, the backend uses `AVCaptureDeviceTypeExternal`). Build and run as on Linux: `cargo run --release -- <mode>`; Xcode command line tools are the only system dependency. Permissions (mic and camera belong to the terminal app) are in the README.
+
+Done for macOS (compiles in CI on `macos-latest`, `.github/workflows/ci.yml`: fmt on Linux, clippy + release tests on ubuntu-latest and macos-latest; not yet run on the Mac at the time of writing):
+- Audio: default `audio.device` = `UMA16` on macOS (`DEFAULT_AUDIO_DEVICE`, `#[cfg]` in `config.rs`; ALSA keeps `hw:CARD=UMA16v2`); `CpalSource::new` matches id or name. CoreAudio reports inputs only as F32, so the stream type follows `default_input_config().sample_format()` (I32/F32/I16, generic `build_stream::<T>`). Without microphone access CoreAudio delivers silence: "Mic live", but an empty overlay.
+- Camera: own AVFoundation backend (`source/video/avfoundation.rs`, see above). `main` calls `video::initialize()` for `camprobe`/`camshot`/`gui`; the CLI modes wait up to 10 s for the permission answer, the GUI camera thread retries (`VideoError::NotAuthorized` as status).
+
+Why not nokhwa on macOS: `nokhwa-bindings-macos` 0.2.4 `AVCaptureDevice::set_all` (lib.rs ≈ 1031–1085) takes `selected_format` from the *last* format with the requested resolution but `selected_range` from the format where the fps matched, ignores the pixel format, and `lock(&self)` never sets `locked`. Setting `activeVideoMaxFrameDuration` (lib.rs:1080) then throws an Objective-C exception, which aborts the process ("panic in a function that cannot unwind"); seen with `camprobe` (`Camera::new` with `RequestedFormatType::None`) and when opening the camera in the GUI. nokhwa is barely maintained, so it is only used on Linux.
+
+First steps on the Mac:
+1. `cargo run --release -- probe`: is the UMA-16 listed, with 16 channels, F32, 48 kHz? Does `UMA16` match its id or name (else set `audio.device`)?
+2. `cargo run --release -- camprobe`: camera name (macOS name may differ from Linux "icspring camera"; set `camera.name` if needed) and its formats/fps ranges. Is 1920x1080 listed, at which fps?
+3. `cargo run --release -- camshot`: one frame as `camshot.png` and the frame time (BGRA → RGBA copy on the CPU). Check orientation and colors (BGRA order) and that the image covers the measured 83° field of view.
+4. `cargo run --release -- mic` (PNG maps), then `gui`: overlay alignment (same camera, same `hfov_deg`), camera dropdown, method switching, mic/camera unplug and replug.
+
+Known risks / likely fixes:
+- Compile errors in `avfoundation.rs` that CI did not catch can only be fixed on the Mac (objc2 signatures were checked against objc2 0.6.5 / objc2-av-foundation 0.3.2 source).
+- If the delegate never fires: the output may need `alwaysDiscardsLateVideoFrames` off, or the session a preset; check `session.isRunning()`.
+- If the active format is reset after `startRunning`: unlock later, or set the format after `startRunning`.
+- Frames from AVFoundation may arrive mirrored for some cameras (`AVCaptureConnection` mirroring); compare with the Linux image.
+- macOS < 14: `AVCaptureDeviceTypeExternal` does not exist (strong link); would need `AVCaptureDeviceTypeExternalUnknown`.
 
 ## Simulator plan
 
