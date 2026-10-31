@@ -75,8 +75,26 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// Horizontal field of view in degrees at this resolution
+    /// Horizontal field of view in degrees at this resolution; ignored with `calibration`
     pub hfov_deg: f64,
+    /// Checkerboard calibration at `width` x `height`; `None`: pinhole from `hfov_deg`
+    pub calibration: Option<Calibration>,
+}
+
+/// Intrinsics from a checkerboard calibration (OpenCV), only valid at the resolution it was
+/// taken at. Pixel-center convention as OpenCV: pixel centers at integer coordinates.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Calibration {
+    /// Focal lengths in pixels
+    pub fx: f64,
+    pub fy: f64,
+    /// Principal point in pixels
+    pub cx: f64,
+    pub cy: f64,
+    /// Distortion coefficients (k1, k2, p1, p2, k3); default zero
+    #[serde(default)]
+    pub dist: [f64; 5],
 }
 
 impl Default for CameraConfig {
@@ -88,15 +106,29 @@ impl Default for CameraConfig {
             fps: 60,
             // Measured on a wall, see CLAUDE.md
             hfov_deg: 83.0,
+            calibration: None,
         }
     }
 }
 
 impl CameraConfig {
-    /// Pinhole model: centered principal point, square pixels, mounted in the array center
+    /// Calibrated intrinsics if given, else a pinhole from `hfov_deg` (centered principal
+    /// point, square pixels); mounted in the array center
     pub fn camera(&self) -> Camera {
+        let intrinsics = match &self.calibration {
+            Some(c) => Intrinsics {
+                width: self.width,
+                height: self.height,
+                fx: c.fx,
+                fy: c.fy,
+                cx: c.cx,
+                cy: c.cy,
+                dist: c.dist,
+            },
+            None => Intrinsics::from_hfov(self.width, self.height, self.hfov_deg.to_radians()),
+        };
         Camera {
-            intrinsics: Intrinsics::from_hfov(self.width, self.height, self.hfov_deg.to_radians()),
+            intrinsics,
             mount: Mount::default(),
         }
     }
@@ -183,6 +215,21 @@ impl Config {
         }
         if b.clean_stop_db < 0.0 || b.clean_beam_cells < 0.0 {
             return Err("beamformer.clean_stop_db and clean_beam_cells must be >= 0".to_string());
+        }
+        if let Some(c) = &self.camera.calibration {
+            if !(c.fx > 0.0 && c.fy > 0.0) {
+                return Err("camera.calibration: fx and fy must be > 0".to_string());
+            }
+            let (w, h) = (self.camera.width as f64, self.camera.height as f64);
+            if !((0.0..w).contains(&c.cx) && (0.0..h).contains(&c.cy)) {
+                return Err(format!(
+                    "camera.calibration: principal point ({}, {}) outside the {w}x{h} image",
+                    c.cx, c.cy
+                ));
+            }
+            if !c.dist.iter().all(|k| k.is_finite()) {
+                return Err("camera.calibration: dist must be finite".to_string());
+            }
         }
         if self.display.db_range <= 0.0 {
             return Err("display.db_range must be > 0".to_string());

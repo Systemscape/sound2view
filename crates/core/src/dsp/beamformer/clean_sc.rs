@@ -124,7 +124,11 @@ impl<const M: usize> Beamformer<M> for CleanSc<M> {
         out: &mut [f64],
     ) {
         let n = self.steering.n_points();
-        assert_eq!(out.len(), n, "length of `out` must match number of grid points");
+        assert_eq!(
+            out.len(),
+            n,
+            "length of `out` must match number of grid points"
+        );
         assert!(
             *bins.end() < cov.len(),
             "`bins` range must not exceed `cov` length"
@@ -175,13 +179,21 @@ fn gaussian_blur(input: &[f64], [width, height]: [usize; 2], sigma: f64, out: &m
 
     let mut rows = vec![0.0; input.len()];
     for r in 0..height {
-        let row = |c: isize| (0..width as isize).contains(&c).then(|| input[r * width + c as usize]);
+        let row = |c: isize| {
+            (0..width as isize)
+                .contains(&c)
+                .then(|| input[r * width + c as usize])
+        };
         for c in 0..width {
             rows[r * width + c] = convolve(&row, c as isize);
         }
     }
     for c in 0..width {
-        let col = |r: isize| (0..height as isize).contains(&r).then(|| rows[r as usize * width + c]);
+        let col = |r: isize| {
+            (0..height as isize)
+                .contains(&r)
+                .then(|| rows[r as usize * width + c])
+        };
         for r in 0..height {
             out[r * width + c] = convolve(&col, r as isize);
         }
@@ -221,8 +233,17 @@ mod test {
         clean_sc.power_map(&cov, BIN..=BIN, &mut power);
 
         let expected = a_0.norm_squared() / 16.0;
-        assert!((power[i_0] - expected).abs() / expected < 1e-9, "P(p_0) = {}", power[i_0]);
-        let rest: f64 = power.iter().enumerate().filter(|&(i, _)| i != i_0).map(|(_, p)| p.abs()).sum();
+        assert!(
+            (power[i_0] - expected).abs() / expected < 1e-9,
+            "P(p_0) = {}",
+            power[i_0]
+        );
+        let rest: f64 = power
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != i_0)
+            .map(|(_, p)| p.abs())
+            .sum();
         assert!(rest < 1e-9 * expected, "clean map outside p_0: {rest}");
     }
 
@@ -255,7 +276,10 @@ mod test {
                 })
                 .unwrap()
         };
-        for ((r, c), col) in [(half_max(0..width / 2), col_1), (half_max(width / 2..width), col_2)] {
+        for ((r, c), col) in [
+            (half_max(0..width / 2), col_1),
+            (half_max(width / 2..width), col_2),
+        ] {
             assert!(
                 r.abs_diff(row) <= 1 && c.abs_diff(col) <= 1,
                 "maximum at ({r}, {c}), source at ({row}, {col})"

@@ -156,8 +156,14 @@ mod tests {
         let scene = test_scene(54.0, DURATION_S);
 
         // 7 does not divide N_FRAMES, so the last read is partial.
-        let chunked = read_all(&mut Simulator::new(scene.clone(), MicArray::uma16()).unwrap(), 7);
-        let single = read_all(&mut Simulator::new(scene, MicArray::uma16()).unwrap(), N_FRAMES);
+        let chunked = read_all(
+            &mut Simulator::new(scene.clone(), MicArray::uma16()).unwrap(),
+            7,
+        );
+        let single = read_all(
+            &mut Simulator::new(scene, MicArray::uma16()).unwrap(),
+            N_FRAMES,
+        );
 
         assert_eq!(chunked.len(), single.len());
         if let Some(i) = chunked.iter().zip(&single).position(|(a, b)| a != b) {

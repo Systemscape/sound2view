@@ -118,11 +118,19 @@ fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
 
 fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
     let audio = &config.audio;
-    println!("Capturing from {} at {} Hz", audio.device, audio.sample_rate);
+    println!(
+        "Capturing from {} at {} Hz",
+        audio.device, audio.sample_rate
+    );
     let mut mic = CpalSource::<16>::new(&audio.device, audio.sample_rate)?;
 
     let sample_rate = audio.sample_rate as f64;
-    run_configured(&mut mic, sample_rate, config, save_maps(Vec::new(), Some(MIC_MAPS)))?;
+    run_configured(
+        &mut mic,
+        sample_rate,
+        config,
+        save_maps(Vec::new(), Some(MIC_MAPS)),
+    )?;
 
     println!("dropped {} chunks", mic.dropped());
     Ok(())

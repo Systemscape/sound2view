@@ -250,7 +250,6 @@ where
     )
 }
 
-
 impl<const M: usize> FrameSource<M> for CpalSource<M> {
     fn sample_rate(&self) -> f64 {
         self.sample_rate

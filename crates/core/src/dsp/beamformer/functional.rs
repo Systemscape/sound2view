@@ -79,7 +79,11 @@ where
             let cov_root = eigen.recompose();
 
             // Grid points are independent: parallel over points, bins stay sequential
-            let points = self.inv_norm2.par_iter().zip(out.par_iter_mut()).enumerate();
+            let points = self
+                .inv_norm2
+                .par_iter()
+                .zip(out.par_iter_mut())
+                .enumerate();
             points.for_each(|(i, (inv_norm2, out_i))| {
                 let a = self.steering.vector(i, k);
                 // w^H R^(1/nu) w with w = a / |a|
@@ -133,7 +137,11 @@ mod test {
         assert_eq!(argmax(&power), i_0);
         let expected = a_0.norm_squared() / 16.0;
         let rel_error = (power[i_0] - expected).abs() / expected;
-        assert!(rel_error < 1e-6, "P(p_0) = {}, expected {expected}", power[i_0]);
+        assert!(
+            rel_error < 1e-6,
+            "P(p_0) = {}, expected {expected}",
+            power[i_0]
+        );
     }
 
     /// With white noise sigma^2 I added, the maximum stays at p_0 and the map is sharper than
@@ -162,6 +170,9 @@ mod test {
 
         let wide = within_3db(1.0);
         let narrow = within_3db(NU);
-        assert!(narrow < wide, "nu = {NU}: {narrow} points within 3 dB, nu = 1: {wide}");
+        assert!(
+            narrow < wide,
+            "nu = {NU}: {narrow} points within 3 dB, nu = 1: {wide}"
+        );
     }
 }

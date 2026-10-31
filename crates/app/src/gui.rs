@@ -76,7 +76,8 @@ fn status_indicator(ui: &mut egui::Ui, status: &DeviceStatus, device: &str) {
     ui.label(RichText::new(status.short(device)).color(theme::TEXT_WEAK))
         .on_hover_text(status.message(device));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, status.color());
+    ui.painter()
+        .circle_filled(rect.center(), 4.0, status.color());
 }
 
 /// Wait between attempts to open the camera or the mic
@@ -159,21 +160,23 @@ impl eframe::App for App {
         let top_frame = egui::Frame::new()
             .fill(theme::PANEL)
             .inner_margin(Margin::symmetric(16, 10));
-        egui::Panel::top("controls").frame(top_frame).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("sound2view").strong().size(18.0));
-                ui.add_space(24.0);
-                self.camera_control(ui);
-                ui.add_space(16.0);
-                redraw_map |= self.controls(ui);
+        egui::Panel::top("controls")
+            .frame(top_frame)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("sound2view").strong().size(18.0));
+                    ui.add_space(24.0);
+                    self.camera_control(ui);
+                    ui.add_space(16.0);
+                    redraw_map |= self.controls(ui);
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_indicator(ui, &camera_status, "Camera");
-                    ui.add_space(12.0);
-                    status_indicator(ui, &audio_status, "Mic");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        status_indicator(ui, &camera_status, "Camera");
+                        ui.add_space(12.0);
+                        status_indicator(ui, &audio_status, "Mic");
+                    });
                 });
             });
-        });
 
         // Apply pipeline settings only when no slider is dragged: each change restarts the
         // pipeline, and the sliding covariance needs a few frames for the first map
@@ -200,39 +203,53 @@ impl eframe::App for App {
         let central_frame = egui::Frame::new()
             .fill(theme::BACKGROUND)
             .inner_margin(Margin::same(12));
-        egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
-            let available = ui.available_rect_before_wrap();
-            let painter = ui.painter();
-            let font = FontId::proportional(STATUS_FONT_SIZE);
-            let camera_message = camera_status.message("Camera");
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show(ui, |ui| {
+                let available = ui.available_rect_before_wrap();
+                let painter = ui.painter();
+                let font = FontId::proportional(STATUS_FONT_SIZE);
+                let camera_message = camera_status.message("Camera");
 
-            let Some(texture) = &self.texture else {
-                let color = ui.visuals().text_color();
-                painter.text(available.center(), Align2::CENTER_CENTER, camera_message, font, color);
-                return;
-            };
+                let Some(texture) = &self.texture else {
+                    let color = ui.visuals().text_color();
+                    painter.text(
+                        available.center(),
+                        Align2::CENTER_CENTER,
+                        camera_message,
+                        font,
+                        color,
+                    );
+                    return;
+                };
 
-            // Largest rectangle with the image aspect ratio, centered in the panel
-            let size = texture.size_vec2();
-            let scale = (available.width() / size.x).min(available.height() / size.y);
-            let rect = Rect::from_center_size(available.center(), size * scale);
-            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                // Largest rectangle with the image aspect ratio, centered in the panel
+                let size = texture.size_vec2();
+                let scale = (available.width() / size.x).min(available.height() / size.y);
+                let rect = Rect::from_center_size(available.center(), size * scale);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
-            painter.image(texture.id(), rect, uv, Color32::WHITE);
-            // The scan grid covers exactly the camera field of view, so the map goes on the
-            // same rectangle as the image. Without a running mic the last map would be stale.
-            if audio_status == DeviceStatus::Running
-                && let Some(map_texture) = &self.map_texture
-            {
-                painter.image(map_texture.id(), rect, uv, Color32::WHITE);
-            }
+                painter.image(texture.id(), rect, uv, Color32::WHITE);
+                // The scan grid covers exactly the camera field of view, so the map goes on the
+                // same rectangle as the image. Without a running mic the last map would be stale.
+                if audio_status == DeviceStatus::Running
+                    && let Some(map_texture) = &self.map_texture
+                {
+                    painter.image(map_texture.id(), rect, uv, Color32::WHITE);
+                }
 
-            // The last frame stays visible but dimmed while the camera is not streaming
-            if camera_status != DeviceStatus::Running {
-                painter.rect_filled(rect, 0.0, Color32::from_black_alpha(160));
-                painter.text(rect.center(), Align2::CENTER_CENTER, camera_message, font, Color32::WHITE);
-            }
-        });
+                // The last frame stays visible but dimmed while the camera is not streaming
+                if camera_status != DeviceStatus::Running {
+                    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(160));
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        camera_message,
+                        font,
+                        Color32::WHITE,
+                    );
+                }
+            });
     }
 }
 
@@ -253,7 +270,11 @@ impl App {
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
 
         Self {
-            rx: spawn_camera(cc.egui_ctx.clone(), config.camera.clone(), Arc::clone(&camera)),
+            rx: spawn_camera(
+                cc.egui_ctx.clone(),
+                config.camera.clone(),
+                Arc::clone(&camera),
+            ),
             texture: None,
             map_rx: spawn_audio(
                 cc.egui_ctx.clone(),
@@ -339,8 +360,11 @@ impl App {
             Method::CleanSc => {
                 ui.add_space(16.0);
                 label(ui, "Sources");
-                ui.add(Slider::new(&mut beamformer.clean_max_iter, CLEAN_MAX_ITER_RANGE))
-                    .on_hover_text("Maximum number of sources removed per frequency bin");
+                ui.add(Slider::new(
+                    &mut beamformer.clean_max_iter,
+                    CLEAN_MAX_ITER_RANGE,
+                ))
+                .on_hover_text("Maximum number of sources removed per frequency bin");
             }
         }
 
@@ -348,16 +372,22 @@ impl App {
         label(ui, "Band");
         // Each end is limited by the other, so the band never collapses
         ui.add(
-            Slider::new(&mut pipeline.f_lo_hz, F_MIN_HZ..=pipeline.f_hi_hz - MIN_BAND_HZ)
-                .logarithmic(true)
-                .suffix(" Hz")
-                .max_decimals(0),
+            Slider::new(
+                &mut pipeline.f_lo_hz,
+                F_MIN_HZ..=pipeline.f_hi_hz - MIN_BAND_HZ,
+            )
+            .logarithmic(true)
+            .suffix(" Hz")
+            .max_decimals(0),
         );
         ui.add(
-            Slider::new(&mut pipeline.f_hi_hz, pipeline.f_lo_hz + MIN_BAND_HZ..=F_MAX_HZ)
-                .logarithmic(true)
-                .suffix(" Hz")
-                .max_decimals(0),
+            Slider::new(
+                &mut pipeline.f_hi_hz,
+                pipeline.f_lo_hz + MIN_BAND_HZ..=F_MAX_HZ,
+            )
+            .logarithmic(true)
+            .suffix(" Hz")
+            .max_decimals(0),
         );
 
         ui.add_space(16.0);
@@ -446,6 +476,7 @@ fn spawn_camera(
 
             let mut failed = 0;
             let mut last_error = String::new();
+            let mut size_checked = false;
             while failed < CAMERA_MAX_FAILED_FRAMES {
                 // Another camera selected: drop this one (end of the loop body), then open it
                 if *shared.choice.lock().unwrap() != choice {
@@ -460,6 +491,17 @@ fn spawn_camera(
                     }
                 };
                 failed = 0;
+                // The overlay is stretched over the frame; intrinsics only fit the configured size
+                if !size_checked {
+                    size_checked = true;
+                    if (frame.width, frame.height) != (width, height) {
+                        eprintln!(
+                            "camera delivers {}x{}, config expects {width}x{height}: \
+                             overlay alignment is off",
+                            frame.width, frame.height
+                        );
+                    }
+                }
                 match tx.try_send(frame) {
                     Ok(()) => ctx.request_repaint(),
                     Err(TrySendError::Full(_)) => {}
@@ -503,15 +545,15 @@ fn spawn_audio(
         let sample_rate = config.audio.sample_rate as f64;
 
         loop {
-            let mut mic = match CpalSource::<16>::new(&config.audio.device, config.audio.sample_rate)
-            {
-                Ok(mic) => mic,
-                Err(e) => {
-                    set_status(&ctx, &status, DeviceStatus::Missing(e.to_string()));
-                    thread::sleep(RETRY);
-                    continue;
-                }
-            };
+            let mut mic =
+                match CpalSource::<16>::new(&config.audio.device, config.audio.sample_rate) {
+                    Ok(mic) => mic,
+                    Err(e) => {
+                        set_status(&ctx, &status, DeviceStatus::Missing(e.to_string()));
+                        thread::sleep(RETRY);
+                        continue;
+                    }
+                };
             set_status(&ctx, &status, DeviceStatus::Running);
 
             // Restart loop for settings changes; ends with the error that closes the mic

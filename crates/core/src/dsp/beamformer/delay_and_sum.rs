@@ -92,7 +92,11 @@ impl<const M: usize> Beamformer<M> for Das<M> {
         for k in bins {
             let cov_k = &cov[k];
             // Grid points are independent: parallel over points, bins stay sequential
-            let points = self.normalization.par_iter().zip(out.par_iter_mut()).enumerate();
+            let points = self
+                .normalization
+                .par_iter()
+                .zip(out.par_iter_mut())
+                .enumerate();
             points.for_each(|(i, (c, out_i))| {
                 let a = self.steering.vector(i, k);
                 let mut p = a.dotc(&(cov_k * a)).re;

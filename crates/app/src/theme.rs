@@ -61,7 +61,11 @@ pub fn apply(ctx: &egui::Context) {
         widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_WEAK);
         for (state, fill, stroke) in [
             (&mut widgets.inactive, SURFACE, BORDER),
-            (&mut widgets.hovered, SURFACE_HOVER, ACCENT.gamma_multiply(0.6)),
+            (
+                &mut widgets.hovered,
+                SURFACE_HOVER,
+                ACCENT.gamma_multiply(0.6),
+            ),
             (&mut widgets.active, SURFACE_HOVER, ACCENT),
             (&mut widgets.open, SURFACE_HOVER, ACCENT),
         ] {

@@ -21,11 +21,11 @@ use objc2::{
     runtime::{AnyObject, Bool, ProtocolObject},
 };
 use objc2_av_foundation::{
-    AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice,
-    AVCaptureDeviceDiscoverySession, AVCaptureDeviceFormat, AVCaptureDeviceInput,
-    AVCaptureDevicePosition, AVCaptureDeviceTypeBuiltInWideAngleCamera,
-    AVCaptureDeviceTypeExternal, AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
-    AVCaptureVideoDataOutputSampleBufferDelegate, AVFrameRateRange, AVMediaTypeVideo,
+    AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceDiscoverySession,
+    AVCaptureDeviceFormat, AVCaptureDeviceInput, AVCaptureDevicePosition,
+    AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal, AVCaptureOutput,
+    AVCaptureSession, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVFrameRateRange, AVMediaTypeVideo,
 };
 use objc2_core_foundation::CFString;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetDimensions};
@@ -35,7 +35,9 @@ use objc2_core_video::{
     CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey,
     kCVPixelFormatType_32BGRA, kCVReturnSuccess,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
+};
 
 use super::{CameraEntry, VideoError};
 use crate::{ImageSource, VideoFrame};
@@ -142,7 +144,10 @@ impl CameraSource {
             let option = format_options(&device)
                 .into_iter()
                 .min_by(|a, b| {
-                    let (a, b) = (a.distance(width, height, fps), b.distance(width, height, fps));
+                    let (a, b) = (
+                        a.distance(width, height, fps),
+                        b.distance(width, height, fps),
+                    );
                     a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
                 })
                 .ok_or_else(|| VideoError::Camera("camera lists no video formats".to_string()))?;
@@ -153,14 +158,15 @@ impl CameraSource {
                 );
             }
 
-            let input =
-                unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }.map_err(ns_error)?;
+            let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
+                .map_err(ns_error)?;
 
             // 32BGRA: AVFoundation converts from the device format, no decoding on our side
             let output = unsafe { AVCaptureVideoDataOutput::new() };
             // SAFETY: CFString and NSString are toll-free bridged
-            let key: &NSString =
-                unsafe { &*(kCVPixelBufferPixelFormatTypeKey as *const CFString).cast::<NSString>() };
+            let key: &NSString = unsafe {
+                &*(kCVPixelBufferPixelFormatTypeKey as *const CFString).cast::<NSString>()
+            };
             let pixel_format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_32BGRA);
             let value: &AnyObject = &pixel_format;
             let settings = NSDictionary::from_slices(&[key], &[value]);
@@ -355,11 +361,12 @@ fn devices() -> Vec<Retained<AVCaptureDevice>> {
             AVCaptureDeviceTypeExternal,
             AVCaptureDeviceTypeBuiltInWideAngleCamera,
         ]);
-        let discovery = AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
-            &types,
-            Some(video_media_type()),
-            AVCaptureDevicePosition::Unspecified,
-        );
+        let discovery =
+            AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
+                &types,
+                Some(video_media_type()),
+                AVCaptureDevicePosition::Unspecified,
+            );
         discovery.devices().to_vec()
     }
 }
