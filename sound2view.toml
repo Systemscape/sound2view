@@ -2,14 +2,16 @@
 # Unknown entries are an error, so typos do not go unnoticed.
 
 [audio]
-# Input device id pattern, see `sound2view probe`
-device = "hw:CARD=UMA16v2"
+# Part of the input device id or name, see `sound2view probe`. Default per platform:
+# "hw:CARD=UMA16v2" on Linux (ALSA lists the UMA-16 several times, only hw: is raw),
+# "UMA16" on macOS
+# device = "hw:CARD=UMA16v2"
 sample_rate = 48000
 
 [camera]
 # Part of the camera name (case-insensitive), see `sound2view camprobe`
 name = "icspring"
-# MJPEG capture format, must be listed by `sound2view camprobe`
+# Capture format, see `sound2view camprobe`; MJPEG if offered, else the closest format
 width = 1920
 height = 1080
 fps = 60

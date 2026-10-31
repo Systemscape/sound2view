@@ -12,7 +12,7 @@ use std::{
 };
 
 use cpal::{
-    BufferSize, ErrorKind, StreamConfig,
+    BufferSize, ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
@@ -20,8 +20,6 @@ use crate::FrameSource;
 
 /// Chunks buffered between the audio callback and `read` before chunks get dropped
 const CHANNEL_CAPACITY: usize = 64;
-/// Full scale of the I32 samples (24 bit left-justified in 32 bit, i.e. 2^31)
-const I32_FULL_SCALE: f64 = 2_147_483_648.0;
 
 /// Case-insensitive patterns that identify the UMA-16 in device ids or descriptions
 const UMA16_PATTERNS: [&str; 2] = ["uma", "minidsp"];
@@ -100,6 +98,8 @@ pub enum CaptureError {
     NoData(Duration),
     #[error("audio stream closed")]
     Closed,
+    #[error("unsupported sample format {0}")]
+    UnsupportedFormat(SampleFormat),
 }
 
 /// `read` gives up after this long without data (e.g. device unplugged without an error)
@@ -107,7 +107,7 @@ const NO_DATA_TIMEOUT: Duration = Duration::from_secs(2);
 /// `read` checks for stream errors at least this often while waiting
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Live capture from an `M`-channel input device with I32 samples
+/// Live capture from an `M`-channel input device
 pub struct CpalSource<const M: usize> {
     /// Keeps the capture running; capture stops when dropped
     _stream: cpal::Stream,
@@ -123,16 +123,24 @@ pub struct CpalSource<const M: usize> {
 }
 
 impl<const M: usize> CpalSource<M> {
-    /// Open the first input device whose id contains `id_pattern` and start capturing.
+    /// Open the first input device whose id or name contains `pattern` and start capturing.
     ///
-    /// - `id_pattern`: e.g. `"hw:CARD=UMA16v2"`, see [`probe`]
+    /// - `pattern`: e.g. `"hw:CARD=UMA16v2"` (ALSA lists the UMA-16 several times, only `hw:` is
+    ///   the raw device) or `"UMA16"` (CoreAudio), see [`probe`]
     /// - `sample_rate`: in Hz, must be supported by the device
-    pub fn new(id_pattern: &str, sample_rate: u32) -> Result<Self, CaptureError> {
+    ///
+    /// The stream uses the device's default sample format (I32 for the UMA-16 on ALSA, F32 on
+    /// CoreAudio), converted to f64 in [-1, 1).
+    pub fn new(pattern: &str, sample_rate: u32) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let device = host
             .input_devices()?
-            .find(|d| d.id().is_ok_and(|id| id.to_string().contains(id_pattern)))
-            .ok_or_else(|| CaptureError::NotFound(id_pattern.to_string()))?;
+            .find(|d| {
+                let id = d.id().map(|id| id.to_string()).unwrap_or_default();
+                let name = d.description().map(|n| n.to_string()).unwrap_or_default();
+                id.contains(pattern) || name.contains(pattern)
+            })
+            .ok_or_else(|| CaptureError::NotFound(pattern.to_string()))?;
 
         let config = StreamConfig {
             channels: M as u16,
@@ -140,33 +148,21 @@ impl<const M: usize> CpalSource<M> {
             buffer_size: BufferSize::Default,
         };
 
-        let (tx, rx): (SyncSender<Vec<f64>>, _) = sync_channel(CHANNEL_CAPACITY);
+        let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
-        let dropped_cb = Arc::clone(&dropped);
         let stream_error = Arc::new(Mutex::new(None));
-        let stream_error_cb = Arc::clone(&stream_error);
+        let callbacks = Callbacks {
+            tx,
+            dropped: Arc::clone(&dropped),
+            stream_error: Arc::clone(&stream_error),
+        };
 
-        let stream = device.build_input_stream(
-            config,
-            move |data: &[i32], _: &_| {
-                let chunk = data.iter().map(|&s| s as f64 / I32_FULL_SCALE).collect();
-                // Never block the audio thread: drop the chunk if the reader is behind
-                if let Err(TrySendError::Full(_)) = tx.try_send(chunk) {
-                    dropped_cb.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-            move |e: cpal::Error| match e.kind() {
-                // Glitches, the stream keeps running
-                ErrorKind::Xrun | ErrorKind::RealtimeDenied | ErrorKind::DeviceChanged => {
-                    eprintln!("audio stream: {e}");
-                }
-                // E.g. device unplugged: keep the first error for `read`
-                _ => {
-                    stream_error_cb.lock().unwrap().get_or_insert(e);
-                }
-            },
-            None,
-        )?;
+        let stream = match device.default_input_config()?.sample_format() {
+            SampleFormat::I32 => build_stream::<i32>(&device, config, callbacks)?,
+            SampleFormat::F32 => build_stream::<f32>(&device, config, callbacks)?,
+            SampleFormat::I16 => build_stream::<i16>(&device, config, callbacks)?,
+            format => return Err(CaptureError::UnsupportedFormat(format)),
+        };
         stream.play()?;
 
         Ok(Self {
@@ -205,6 +201,55 @@ impl<const M: usize> CpalSource<M> {
         }
     }
 }
+
+/// Shared state of the stream callbacks
+struct Callbacks {
+    /// Interleaved chunks for `read`
+    tx: SyncSender<Vec<f64>>,
+    dropped: Arc<AtomicUsize>,
+    stream_error: Arc<Mutex<Option<cpal::Error>>>,
+}
+
+/// Input stream with sample type `T`; each callback buffer is converted to f64 in [-1, 1)
+/// (integers divided by their full scale, e.g. 2^31 for I32) and sent as one chunk.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    callbacks: Callbacks,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: SizedSample + Send + 'static,
+    f64: FromSample<T>,
+{
+    let Callbacks {
+        tx,
+        dropped,
+        stream_error,
+    } = callbacks;
+
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &_| {
+            let chunk = data.iter().map(|&s| s.to_sample::<f64>()).collect();
+            // Never block the audio thread: drop the chunk if the reader is behind
+            if let Err(TrySendError::Full(_)) = tx.try_send(chunk) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        move |e: cpal::Error| match e.kind() {
+            // Glitches, the stream keeps running
+            ErrorKind::Xrun | ErrorKind::RealtimeDenied | ErrorKind::DeviceChanged => {
+                eprintln!("audio stream: {e}");
+            }
+            // E.g. device unplugged: keep the first error for `read`
+            _ => {
+                stream_error.lock().unwrap().get_or_insert(e);
+            }
+        },
+        None,
+    )
+}
+
 
 impl<const M: usize> FrameSource<M> for CpalSource<M> {
     fn sample_rate(&self) -> f64 {

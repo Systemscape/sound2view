@@ -15,10 +15,29 @@ use nokhwa::{
 
 use crate::{ImageSource, VideoFrame};
 
+/// Request camera access; required once on macOS before any other camera call (the OS asks the
+/// user on the first run). Returns immediately, see [`is_authorized`]. No-op on Linux.
+pub fn initialize() {
+    nokhwa::nokhwa_initialize(|granted| {
+        if !granted {
+            eprintln!("{}", VideoError::NotAuthorized);
+        }
+    });
+}
+
+/// True once camera access is granted; always true on Linux
+pub fn is_authorized() -> bool {
+    nokhwa::nokhwa_check()
+}
+
 /// Print all cameras with their supported formats, one line per format.
 ///
-/// On Linux the user must be in the `video` group, see the README.
+/// On Linux the user must be in the `video` group, on macOS the terminal needs camera access,
+/// see the README.
 pub fn probe() -> Result<(), Box<dyn Error>> {
+    if !is_authorized() {
+        println!("{}", VideoError::NotAuthorized);
+    }
     let cameras = query(ApiBackend::Auto)?;
     if cameras.is_empty() {
         println!("no cameras found");
@@ -52,6 +71,8 @@ pub fn probe() -> Result<(), Box<dyn Error>> {
 pub enum VideoError {
     #[error("no camera with {0:?} in its name")]
     NotFound(String),
+    #[error("camera access not granted (macOS: System Settings, Privacy & Security, Camera)")]
+    NotAuthorized,
     #[error("camera: {0}")]
     Camera(#[from] NokhwaError),
 }
@@ -62,20 +83,34 @@ pub struct CameraSource {
 }
 
 impl CameraSource {
-    /// Open camera `index` (see [`probe`]) with MJPEG at `width` x `height` and `fps`, and start
-    /// streaming.
+    /// Open camera `index` (see [`probe`]) at `width` x `height` and `fps`, and start streaming.
+    ///
+    /// Tries MJPEG first; if the camera does not offer it exactly (AVFoundation often lists only
+    /// uncompressed formats such as NV12 or YUYV), takes the closest format. The RGBA decoder
+    /// handles both. A different resolution is printed, because the field of view in the config
+    /// belongs to the requested one.
     pub fn new(index: u32, width: u32, height: u32, fps: u32) -> Result<Self, VideoError> {
-        let format = RequestedFormatType::Exact(CameraFormat::new(
-            Resolution::new(width, height),
-            FrameFormat::MJPEG,
-            fps,
-        ));
+        if !is_authorized() {
+            return Err(VideoError::NotAuthorized);
+        }
 
-        let mut camera = Camera::new(
-            CameraIndex::Index(index),
-            RequestedFormat::new::<RgbAFormat>(format),
-        )?;
-        camera.open_stream()?;
+        let requested = CameraFormat::new(Resolution::new(width, height), FrameFormat::MJPEG, fps);
+        let open = |format: RequestedFormatType| -> Result<Camera, NokhwaError> {
+            let mut camera = Camera::new(
+                CameraIndex::Index(index),
+                RequestedFormat::new::<RgbAFormat>(format),
+            )?;
+            camera.open_stream()?;
+            Ok(camera)
+        };
+
+        let camera = open(RequestedFormatType::Exact(requested))
+            .or_else(|_| open(RequestedFormatType::Closest(requested)))?;
+
+        let actual = camera.camera_format();
+        if actual.resolution() != requested.resolution() {
+            eprintln!("camera {index}: requested {requested}, got {actual}");
+        }
 
         Ok(Self { camera })
     }

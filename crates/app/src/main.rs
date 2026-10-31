@@ -1,4 +1,11 @@
-use std::{env, error::Error, fs, ops::ControlFlow, time::Instant};
+use std::{
+    env,
+    error::Error,
+    fs,
+    ops::ControlFlow,
+    thread,
+    time::{Duration, Instant},
+};
 
 use image::RgbaImage;
 use sound2view_core::{
@@ -26,6 +33,8 @@ mod theme;
 const MIC_MAPS: usize = 20;
 /// Frames timed in camshot mode
 const CAMSHOT_FRAMES: usize = 60;
+/// CLI modes wait this long for the user to grant camera access (macOS asks on the first run)
+const CAMERA_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Usage (settings from `sound2view.toml`, see `config.rs`):
 /// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
@@ -41,11 +50,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match arg.as_str() {
         "probe" => capture::probe(),
-        "camprobe" => video::probe(),
-        "camshot" => camshot(&Config::load(CONFIG_PATH)?),
-        "gui" => run_gui(Config::load(CONFIG_PATH)?),
+        "camprobe" => {
+            init_camera();
+            video::probe()
+        }
+        "camshot" => {
+            init_camera();
+            camshot(&Config::load(CONFIG_PATH)?)
+        }
+        "gui" => {
+            // The camera thread retries until access is granted
+            video::initialize();
+            run_gui(Config::load(CONFIG_PATH)?)
+        }
         "mic" => run_mic(&Config::load(CONFIG_PATH)?),
         path => run_sim(path, &Config::load(CONFIG_PATH)?),
+    }
+}
+
+/// Request camera access and wait until it is granted or `CAMERA_AUTH_TIMEOUT` passed; instant on
+/// Linux
+fn init_camera() {
+    video::initialize();
+    let start = Instant::now();
+    while !video::is_authorized() && start.elapsed() < CAMERA_AUTH_TIMEOUT {
+        thread::sleep(Duration::from_millis(100));
     }
 }
 

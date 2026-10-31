@@ -43,16 +43,24 @@ impl Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
-    /// Input device id pattern, see `sound2view probe`
+    /// Part of the input device id or name, see `sound2view probe`; default per platform
+    /// (`DEFAULT_AUDIO_DEVICE`)
     pub device: String,
     /// In Hz, must be supported by the device
     pub sample_rate: u32,
 }
 
+/// ALSA lists the UMA-16 several times (hw, plughw, dsnoop, ...); only `hw:` is the raw device
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_AUDIO_DEVICE: &str = "hw:CARD=UMA16v2";
+/// CoreAudio lists it once; id (device UID) and name contain the product name
+#[cfg(target_os = "macos")]
+const DEFAULT_AUDIO_DEVICE: &str = "UMA16";
+
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            device: "hw:CARD=UMA16v2".to_string(),
+            device: DEFAULT_AUDIO_DEVICE.to_string(),
             sample_rate: 48_000,
         }
     }
@@ -63,7 +71,7 @@ impl Default for AudioConfig {
 pub struct CameraConfig {
     /// Part of the camera name (case-insensitive), see `sound2view camprobe`
     pub name: String,
-    /// Capture format (MJPEG), must be listed by `sound2view camprobe`
+    /// Capture format, see `sound2view camprobe`; MJPEG if offered, else the closest format
     pub width: u32,
     pub height: u32,
     pub fps: u32,
