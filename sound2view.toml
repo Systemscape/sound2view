@@ -45,7 +45,7 @@ grid_z = 2.0
 
 [beamformer]
 # "das", "functional" or "clean_sc" (selectable in the GUI)
-method = "functional"
+method = "clean_sc"
 # Exponent of functional beamforming: larger is sharper, more sensitive to model errors
 nu = 20.0
 # Functional: subtract the median eigenvalue (noise estimate) per bin (toggle in the GUI)
@@ -93,13 +93,26 @@ smoothing = 0.5
 enabled = true
 # Model exported by voice-activity-detection, relative to the working directory
 model = "model/speech_detector.json"
-# Smoothed probability at which a track counts as speech (adjustable in the GUI)
-threshold = 0.9
-# A track stays speech while the smoothed probability is above threshold - release; below
-# threshold
-release = 0.15
-# Speech is held this long after the probability fell below threshold - release, in ms
-hangover_ms = 300.0
-# Classifier frames quieter than this count as non-speech (dB of the beam signal: full scale at
-# the mic, referenced to 1 m)
+# Smoothed probability at which a track becomes speech (adjustable in the GUI)
+on_threshold = 0.95
+# Speech is held this long after the last frame at on_threshold or above, in ms (pauses between
+# words stay speech; other sounds after the speech do not keep it)
+hold_ms = 500.0
+# Time constant of the probability smoothing, in ms (0: no smoothing)
+smoothing_ms = 50.0
+# The smoothed probability must stay at on_threshold this long before a track turns green, in ms
+# (snapping and clapping are shorter than a syllable)
+min_onset_ms = 80.0
+# A speech track whose audio correlates at least this much (within 20 ms) with a speech track that
+# has echo_margin_db more speech energy repeats its speech (reflection, ghost, leakage into another
+# sound such as snapping) and stays blue ("echo of #N"); 1 turns the check off
+echo_correlation = 0.2
+echo_margin_db = 6.0
+# Speech ends at once when the track moves farther than this (grid cells) from where it was last
+# clearly speech, so another source nearby that takes over the track does not inherit it
+max_shift_cells = 3.0
+# Gain on the track audio before the classifier, in dB (the classifier expects microphone levels,
+# speech around -25 dBFS; the UMA-16 gives about -60 dBFS)
+gain_db = 36.0
+# Classifier frames quieter than this (after gain_db) count as non-speech, in dBFS
 min_level_db = -55.0

@@ -6,3 +6,4 @@ track_*.wav
 
 .DS_Store
 *.swp
+!assets/*.png

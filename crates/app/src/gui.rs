@@ -109,15 +109,18 @@ const BAND_HELP: &str = "Frequency range summed into the map. Lower frequencies 
     appear. For a single tone, narrow the band around it.";
 const OVERLAY_HELP: &str = "Dynamic range of the overlay: everything more than this many dB \
     below the loudest point is transparent. Smaller values show only the strongest sources.";
-/// Radius of the dot per estimated source in screen points, and size of its level label
-const PEAK_RADIUS: f32 = 7.0;
-const PEAK_FONT_SIZE: f32 = 14.0;
+/// Track marker radius and label size as a fraction of the drawn image height (scales with the
+/// screen), with lower limits in screen points
+const MARKER_RADIUS: f32 = 0.011;
+const MARKER_RADIUS_MIN: f32 = 8.0;
+const MARKER_FONT: f32 = 0.02;
+const MARKER_FONT_MIN: f32 = 15.0;
 
 /// Slider limits
 const NU_RANGE: RangeInclusive<f64> = 1.0..=100.0;
 const CLEAN_MAX_ITER_RANGE: RangeInclusive<usize> = 1..=30;
 const DB_RANGE_RANGE: RangeInclusive<f64> = 1.0..=20.0;
-/// Speech threshold limits; the lower one is also kept above `speech.release`, so speech can end
+/// Speech threshold limits
 const SPEECH_THRESHOLD_MIN: f32 = 0.3;
 const SPEECH_THRESHOLD_MAX: f32 = 0.99;
 /// Band limits in Hz; above about 6 kHz grating lobes appear in the image
@@ -160,8 +163,6 @@ pub struct App {
     tracking: TrackerConfig,
     /// Speech detection on (`speech.enabled`); the threshold slider is shown only then
     speech_enabled: bool,
-    /// `speech.release`, lower limit of the threshold slider
-    speech_release: f32,
     /// Speech threshold edited in the GUI
     speech_threshold: f32,
     /// Read by the audio thread once per map, as f32 bits; no pipeline restart
@@ -318,7 +319,8 @@ impl App {
             cameras: Mutex::new(Vec::new()),
         });
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
-        let shared_speech_threshold = Arc::new(AtomicU32::new(config.speech.threshold.to_bits()));
+        let shared_speech_threshold =
+            Arc::new(AtomicU32::new(config.speech.on_threshold.to_bits()));
 
         Self {
             rx: spawn_camera(
@@ -340,8 +342,7 @@ impl App {
             peaks: config.peaks.clone(),
             tracking: config.tracking.clone(),
             speech_enabled: config.speech.enabled,
-            speech_release: config.speech.release,
-            speech_threshold: config.speech.threshold,
+            speech_threshold: config.speech.on_threshold,
             shared_speech_threshold,
             settings,
             shared_settings,
@@ -497,14 +498,18 @@ impl App {
 
         if self.speech_enabled {
             ui.add_space(16.0);
-            let help = "Speech probability (smoothed) at which a track turns green. Raise it if \
-                noise or music turns green, lower it if speech stays blue. Applies immediately.";
+            let help = "Speech probability (smoothed) at which a track turns green. It stays \
+                green for speech.hold_ms after the last time the probability was this high. Raise \
+                it if noise or music turns green, lower it if speech stays blue. Applies \
+                immediately.";
             label(ui, "Speech").on_hover_text(help);
-            let min = SPEECH_THRESHOLD_MIN.max(self.speech_release + 0.05);
             let changed = ui
                 .add(
-                    Slider::new(&mut self.speech_threshold, min..=SPEECH_THRESHOLD_MAX)
-                        .max_decimals(2),
+                    Slider::new(
+                        &mut self.speech_threshold,
+                        SPEECH_THRESHOLD_MIN..=SPEECH_THRESHOLD_MAX,
+                    )
+                    .max_decimals(2),
                 )
                 .on_hover_text(help)
                 .changed();
@@ -526,30 +531,57 @@ fn draw_tracks(
     tracks: &[Track],
     speech: &HashMap<u64, SpeechStatus>,
 ) {
-    let font = FontId::proportional(PEAK_FONT_SIZE);
+    let radius = (MARKER_RADIUS * rect.height()).max(MARKER_RADIUS_MIN);
+    let font = FontId::proportional((MARKER_FONT * rect.height()).max(MARKER_FONT_MIN));
+    let shade = Color32::from_black_alpha(170);
     for track in tracks.iter().filter(|track| track.confirmed) {
         // Grid cell centers at (col + 0.5) / width of the image
         let x = rect.left() + (track.col as f32 + 0.5) / width as f32 * rect.width();
         let y = rect.top() + (track.row as f32 + 0.5) / height as f32 * rect.height();
         let center = pos2(x, y);
         let status = speech.get(&track.id);
-        let fill = if status.is_some_and(|s| s.speech) {
-            theme::SPEECH
+        let is_speech = status.is_some_and(|s| s.speech);
+
+        // Speech: large filled green dot with a halo; other sources: hollow blue ring. Shape and
+        // fill differ, not only the color.
+        let marker_radius = if is_speech {
+            painter.circle_stroke(
+                center,
+                1.9 * radius,
+                Stroke::new(0.25 * radius, theme::SPEECH.gamma_multiply(0.5)),
+            );
+            painter.circle(center, 1.3 * radius, theme::SPEECH, Stroke::new(2.0, Color32::WHITE));
+            1.9 * radius
         } else {
-            theme::PEAK
+            painter.circle_filled(center, radius, shade);
+            painter.circle_stroke(center, radius, Stroke::new(0.35 * radius, theme::PEAK));
+            radius
         };
-        painter.circle(center, PEAK_RADIUS, fill, Stroke::new(2.0, Color32::WHITE));
+
         let mut text = format!("#{} {:.1} dB", track.id, track.level_db);
         if let Some(status) = status {
-            text += &format!(" {:.0} %", 100.0 * status.probability);
+            text += &format!("  {:.0} %", 100.0 * status.probability);
         }
-        painter.text(
-            pos2(x + PEAK_RADIUS + 4.0, y),
-            Align2::LEFT_CENTER,
-            text,
-            font.clone(),
-            Color32::WHITE,
+        if is_speech {
+            text += "  speech";
+        } else if let Some(source) = status.and_then(|s| s.echo_of) {
+            text += &format!("  echo of #{source}");
+        }
+        // Label on a pill: green with dark text for speech, dark with white text otherwise
+        let (pill, text_color) = if is_speech {
+            (theme::SPEECH, theme::BACKGROUND)
+        } else {
+            (shade, Color32::WHITE)
+        };
+        let galley = painter.layout_no_wrap(text, font.clone(), text_color);
+        let padding = egui::vec2(0.4, 0.15) * font.size;
+        let min = pos2(
+            x + marker_radius + 0.4 * font.size,
+            y - galley.size().y / 2.0 - padding.y,
         );
+        let pill_rect = Rect::from_min_size(min, galley.size() + 2.0 * padding);
+        painter.rect_filled(pill_rect, 0.3 * font.size, pill);
+        painter.galley(min + padding, galley, text_color);
     }
 }
 
@@ -727,7 +759,7 @@ fn spawn_audio(
                         let speech = match &mut speech {
                             Some(detector) => {
                                 let threshold = speech_threshold.load(Ordering::Relaxed);
-                                detector.set_threshold(f32::from_bits(threshold));
+                                detector.set_on_threshold(f32::from_bits(threshold));
                                 detector.update(tracks)?;
                                 detector.statuses()
                             }

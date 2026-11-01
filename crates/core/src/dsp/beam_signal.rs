@@ -6,7 +6,7 @@ use std::{f64::consts::PI, sync::Arc};
 use nalgebra::SVector;
 use realfft::{ComplexToReal, RealFftPlanner};
 
-use crate::{Complex64, geometry::mic_array::MicArray};
+use crate::{Complex64, distance_to_delay, geometry::mic_array::MicArray};
 
 /// Sample rate of the beam signal in Hz (what speech classifiers expect)
 pub const TRACK_SAMPLE_RATE: f64 = 16_000.0;
@@ -19,11 +19,15 @@ pub fn decimation_factor(sample_rate: f64) -> Option<usize> {
 
 /// Delay and sum toward one point, as a stream of time samples.
 ///
-/// Per STFT frame y(f_k) = w_k^H x(f_k) with w = a / (a^H a), so a source at the point comes out
-/// as its signal s(t) referenced to 1 m (w^H a = 1), without the propagation delay. The inverse
-/// FFT of y gives the windowed segment; consecutive segments overlap by N/2 and the periodic
-/// Hann window sums to 1, so overlap-add reconstructs the signal. Steering applies the same
-/// circular time shift to every frame, which keeps that sum at 1.
+/// Per STFT frame y(f_k) = w_k^H x(f_k) with w = a e^{j omega r_ref / c} / (a^H a), so a source at
+/// the point comes out as its signal s(t - r_ref / c) referenced to 1 m, with r_ref the mean
+/// mic distance. The inverse FFT of y gives the windowed segment; consecutive segments overlap
+/// by N/2 and the periodic Hann window sums to 1, so overlap-add reconstructs the signal.
+///
+/// The weights shift each mic's frame circularly by (r_m - r_ref) / c, at most about 13 samples
+/// at 48 kHz, where the window is nearly 0. Removing the whole delay r_m / c instead (about 280
+/// samples at 2 m) wraps the window around the frame and breaks the overlap-add: an error at
+/// every hop, heard as a buzz.
 pub struct BeamSignal<const M: usize> {
     /// w_k per bin for the current point
     weights: Vec<SVector<Complex64, M>>,
@@ -72,9 +76,13 @@ impl<const M: usize> BeamSignal<M> {
 
     /// Point the beam at the point with mic distances `distances`
     pub fn steer(&mut self, distances: &[f64; M]) {
+        let delay_ref = distance_to_delay(distances.iter().sum::<f64>() / M as f64);
         for (k, w) in self.weights.iter_mut().enumerate() {
-            let a = MicArray::steering_from_distances(distances, k as f64 * self.df);
-            *w = a.unscale(a.norm_squared());
+            let freq = k as f64 * self.df;
+            let a = MicArray::steering_from_distances(distances, freq);
+            // Keep the common delay: w^H gets e^{-j omega tau_ref}
+            let keep_delay = Complex64::from_polar(1.0, 2.0 * PI * freq * delay_ref);
+            *w = a.unscale(a.norm_squared()) * keep_delay;
         }
     }
 
@@ -185,13 +193,13 @@ mod test {
 
     use super::{BeamSignal, Decimator, TRACK_SAMPLE_RATE, decimation_factor};
     use crate::{
-        Point3,
+        Point3, distance_to_delay,
         dsp::stft::{Stft, StftStream},
         geometry::mic_array::MicArray,
         source::simulator::{
             Simulator,
             scene::{MicNoiseParams, Scene, Source},
-            signal::{Signal, Sine},
+            signal::{Noise, NoiseParams, Signal, Sine},
         },
         test_util::{FFT_LEN, SAMPLE_RATE, read_all},
     };
@@ -251,32 +259,37 @@ mod test {
         assert_eq!(decimation_factor(8_000.0), None);
     }
 
-    /// Without decimation, a bin-centered sine at the beam point comes out as s(t) itself
-    /// (referenced to 1 m, no propagation delay) once the first half frame has passed. Exact:
-    /// steering shifts every frame by the same circular delay, which a bin-centered sine does not
-    /// notice and which keeps the window sum at 1.
+    /// Without decimation, a source at the beam point comes out as s(t - r_ref / c) (referenced
+    /// to 1 m, r_ref the mean mic distance) once the first frame has passed. Band noise at
+    /// off-bin frequencies is not periodic in the frame, so a circular shift that wraps the
+    /// window would show up here (a bin-centered sine hides it).
     #[test]
     fn reconstructs_source_signal() {
+        let pos = Point3::new(0.4, 0.2, 2.0);
+        let signal = Signal::Noise(Noise::from(NoiseParams {
+            seed: 3,
+            n_components: 200,
+            f_lo_hz: 200.0,
+            f_hi_hz: 6000.0,
+            level_db: 94.0,
+        }));
         // Factor 1 needs a 16 kHz scene
-        let bin = 50;
-        let pos = Point3::new(0.1, 0.2, 1.0);
-        let mut scene = sine_scene(&[(bin, pos)], 0.5);
+        let mut scene = sine_scene(&[(50, pos)], 1.0);
         scene.sample_rate = TRACK_SAMPLE_RATE;
-        let freq = bin as f64 * TRACK_SAMPLE_RATE / FFT_LEN as f64;
-        scene.sources[0].signal = Signal::Sine(Sine::new(1.0, freq, 0.0));
+        scene.sources[0].signal = signal.clone();
 
         let output = beam_output(&scene, &pos, 1);
-        let worst = output
-            .iter()
-            .enumerate()
-            .skip(FFT_LEN / 2)
-            .map(|(n, &y)| {
-                let expected = (2.0 * PI * freq * n as f64 / TRACK_SAMPLE_RATE).sin();
-                (y as f64 - expected).abs()
-            })
-            .fold(0.0, f64::max);
-        // f32 output precision
-        assert!(worst < 1e-6, "largest error {worst}");
+        let distances = MicArray::uma16().get_distance_from(&pos);
+        let delay_ref = distance_to_delay(distances.iter().sum::<f64>() / 16.0);
+        let (mut error, mut power) = (0.0, 0.0);
+        for (n, &y) in output.iter().enumerate().skip(FFT_LEN) {
+            let expected = signal.eval(n as f64 / TRACK_SAMPLE_RATE - delay_ref);
+            error += (y as f64 - expected).powi(2);
+            power += expected.powi(2);
+        }
+        let relative = (error / power).sqrt();
+        // About 1e-7 (wrap at the window tails); 2e-2 with the whole delay removed
+        assert!(relative < 1e-5, "relative error {relative}");
     }
 
     /// At 48 kHz the decimated output keeps the source amplitude.

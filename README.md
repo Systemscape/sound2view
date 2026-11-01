@@ -1,5 +1,7 @@
 # sound2view
 
+<img src="assets/logo.svg" alt="sound2view logo" width="96" align="right">
+
 Acoustic camera with the miniDSP UMA-16 v2.
 
 ## Linux setup

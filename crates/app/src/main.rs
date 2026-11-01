@@ -297,11 +297,17 @@ impl TrackRecorder {
     }
 }
 
+/// Window and dock icon, rendered from `assets/logo.svg`
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/logo-256.png");
+
 fn run_gui(config: Config) -> Result<(), Box<dyn Error>> {
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG)?;
     eframe::run_native(
         "sound2view",
         eframe::NativeOptions {
-            viewport: eframe::egui::ViewportBuilder::default().with_maximized(true),
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_maximized(true)
+                .with_icon(icon),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(gui::App::new(cc, config)))),

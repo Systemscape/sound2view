@@ -207,7 +207,7 @@ pub struct BeamformerConfig {
 impl Default for BeamformerConfig {
     fn default() -> Self {
         Self {
-            method: Method::Functional,
+            method: Method::CleanSc,
             nu: 20.0,
             functional_noise_removal: true,
             functional_equal_bins: true,
