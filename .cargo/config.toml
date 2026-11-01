@@ -1,4 +1,0 @@
-# Private git dependency (voice-activity-detection) over SSH: let cargo use the git CLI and its
-# SSH agent instead of libgit2
-[net]
-git-fetch-with-cli = true

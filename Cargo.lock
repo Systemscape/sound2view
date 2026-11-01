@@ -6100,7 +6100,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "voice-activity-detection"
 version = "0.1.0"
-source = "git+ssh://git@github.com/Systemscape/voice-activity-detection.git?rev=5f9346de6b1e295613c96559b149bf41acbab9dc#5f9346de6b1e295613c96559b149bf41acbab9dc"
+source = "git+https://github.com/Systemscape/voice-activity-detection.git?rev=5f9346de6b1e295613c96559b149bf41acbab9dc#5f9346de6b1e295613c96559b149bf41acbab9dc"
 dependencies = [
  "burn",
  "eframe 0.36.2",

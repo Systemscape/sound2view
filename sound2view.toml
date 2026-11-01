@@ -62,6 +62,10 @@ clean_max_iter = 10
 clean_stop_db = 20.0
 # CLEAN-SC: width (standard deviation) of the Gaussian clean beam in grid cells; 0: single points
 clean_beam_cells = 1.5
+# CLEAN-SC: give every frequency bin with a source the same weight in the map (toggle in the
+# settings menu). Otherwise the loudest bins decide, and those are the low ones, where the array
+# cannot separate a source from its reflection off a wall or the ceiling
+clean_equal_bins = true
 
 [display]
 # Overlay range in dB below the map maximum (adjustable in the GUI)
@@ -69,7 +73,7 @@ db_range = 3.0
 
 [peaks]
 # Local maxima of each map, followed as tracks (see [tracking])
-# Show the tracks as blue dots (toggle "Sources" in the GUI)
+# Show the tracks as dots (toggle "Tracks" in the GUI)
 enabled = true
 # Only maxima at most this many dB below the map maximum
 range_db = 6.0
@@ -77,16 +81,22 @@ range_db = 6.0
 min_dist_cells = 4.0
 # At most this many peaks, strongest first
 max_count = 5
+# A peak is a source only if this many dB more power arrives coherently from its direction than
+# from any direction in silence (the noise floor, learned from the quietest map of the last
+# minute: a pause between words is enough; a steady background source such as a fan is part of
+# it). Slider next to "Tracks" in the GUI
+min_above_floor_db = 8.0
 
 [tracking]
 # A peak continues a track if it is at most this far away, in grid cells
 max_dist_cells = 6.0
-# Maps in a row with a matching peak until a track is shown (and recorded in the CLI modes)
+# Maps with a matching peak (not in a row) until a track is shown (and recorded in the CLI modes)
 min_hits = 3
 # Maps in a row without a matching peak until a track is dropped
 max_missed = 5
-# Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly
-smoothing = 0.5
+# Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly (less
+# puts the dot between two spots when the map's maximum jumps, e.g. to a reflection)
+smoothing = 1.0
 
 [speech]
 # Classify the audio of each track (voice-activity-detection model); speech tracks are green
@@ -116,3 +126,7 @@ max_shift_cells = 3.0
 gain_db = 36.0
 # Classifier frames quieter than this (after gain_db) count as non-speech, in dBFS
 min_level_db = -55.0
+# A track is speech only while at least this fraction (dB) of the power received above 2 kHz
+# arrives coherently from it: below 2 kHz every beam carries every talker, so a talker elsewhere
+# (also outside the image) would turn other tracks green
+min_source_db = -6.0

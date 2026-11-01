@@ -26,7 +26,11 @@ use crate::{
 ///   it would add its noise or reflection maximum.
 ///
 /// The clean maps of all bins are summed (bins in parallel) and convolved with a Gaussian clean
-/// beam. Without diagonal removal, mic noise sigma^2 I is a floor in every dirty map.
+/// beam. With `equal_bins` each bin's clean map is divided by its maximum first (bins without a
+/// source stay zero), so every bin with a source has the same say: otherwise the loudest bins
+/// decide, and those are the low ones, where the array cannot separate a source from its
+/// reflection off a wall or ceiling and the maximum lands anywhere between. Without diagonal
+/// removal, mic noise sigma^2 I is a floor in every dirty map.
 pub struct CleanSc<const M: usize> {
     steering: Steering<M>,
     /// Loop gain in (0, 1]
@@ -39,6 +43,8 @@ pub struct CleanSc<const M: usize> {
     beam_sigma: f64,
     /// Zero the diagonal of R (removes mic self-noise)
     remove_diag: bool,
+    /// Divide each bin's clean map by its maximum before summing
+    equal_bins: bool,
     /// 1 / (|a| sqrt(M)), or sqrt(M - 1) with diagonal removal, per grid point; scales a to w
     weight_scale: Vec<f64>,
 }
@@ -61,6 +67,7 @@ impl<const M: usize> CleanSc<M> {
     /// - `stop_db`: stop when the maximum is this many dB below the largest one of all bins, >= 0
     /// - `beam_sigma`: clean beam standard deviation in grid cells, >= 0
     /// - `remove_diag`: zero the diagonal of R, removes mic self-noise
+    /// - `equal_bins`: divide each bin's clean map by its maximum before summing
     ///
     /// Panics on values outside these ranges.
     pub fn new(
@@ -70,6 +77,7 @@ impl<const M: usize> CleanSc<M> {
         stop_db: f64,
         beam_sigma: f64,
         remove_diag: bool,
+        equal_bins: bool,
     ) -> Self {
         assert!(gain > 0.0 && gain <= 1.0, "gain must be in (0, 1]");
         assert!(max_iter > 0, "max_iter must be at least 1");
@@ -91,6 +99,7 @@ impl<const M: usize> CleanSc<M> {
             stop_ratio: 10f64.powf(-stop_db / 10.0),
             beam_sigma,
             remove_diag,
+            equal_bins,
             weight_scale,
         }
     }
@@ -227,7 +236,16 @@ impl<const M: usize> Beamformer<M> for CleanSc<M> {
             .fold(
                 || vec![0.0; n],
                 |mut clean, bin| {
-                    self.clean_bin(bin, threshold, &mut clean);
+                    if self.equal_bins {
+                        let mut single = vec![0.0; n];
+                        self.clean_bin(bin, threshold, &mut single);
+                        let max = single.iter().copied().fold(0.0, f64::max);
+                        if max > 0.0 {
+                            clean.iter_mut().zip(&single).for_each(|(c, s)| *c += s / max);
+                        }
+                    } else {
+                        self.clean_bin(bin, threshold, &mut clean);
+                    }
                     clean
                 },
             )
@@ -307,7 +325,7 @@ mod test {
         MicArray::uma16().steering(&scan_grid.points()[i], f)
     }
 
-    /// Clean map of `cov` at bins `bins`, no clean beam
+    /// Clean map of `cov` at bins `bins`, no clean beam, bins summed as they are
     fn clean_map(
         cov: &[SMatrix<Complex64, 16, 16>],
         bins: std::ops::RangeInclusive<usize>,
@@ -315,9 +333,21 @@ mod test {
         stop_db: f64,
         remove_diag: bool,
     ) -> Vec<f64> {
+        clean_map_equal(cov, bins, gain, stop_db, remove_diag, false)
+    }
+
+    /// As `clean_map`, with or without `equal_bins`
+    fn clean_map_equal(
+        cov: &[SMatrix<Complex64, 16, 16>],
+        bins: std::ops::RangeInclusive<usize>,
+        gain: f64,
+        stop_db: f64,
+        remove_diag: bool,
+        equal_bins: bool,
+    ) -> Vec<f64> {
         let scan_grid = test_scan_grid();
         let steering = Steering::new(&scan_grid, &MicArray::uma16(), SAMPLE_RATE, FFT_LEN);
-        let clean_sc = CleanSc::new(steering, gain, 30, stop_db, 0.0, remove_diag);
+        let clean_sc = CleanSc::new(steering, gain, 30, stop_db, 0.0, remove_diag, equal_bins);
         let mut power = vec![0.0; scan_grid.points().len()];
         clean_sc.power_map(cov, bins, &mut power);
         power
@@ -418,6 +448,30 @@ mod test {
         assert!(power[i_1] > 0.0, "weak bin not cleaned at 40 dB");
     }
 
+    /// With equal bins the 30 dB weaker source gets the same height as the strong one (each
+    /// bin's map is divided by its maximum: 1 at the source with gain 1 and no clean beam); a
+    /// bin that cleaned nothing (below the threshold) still adds nothing.
+    #[test]
+    fn equal_bins_level_the_bins() {
+        let scan_grid = test_scan_grid();
+        let (i_0, i_1) = (scan_grid.index(40, 100), scan_grid.index(20, 30));
+        let weak_bin = BIN + 10;
+        let a_0 = steering_at(&scan_grid, i_0, BIN);
+        let a_1 = steering_at(&scan_grid, i_1, weak_bin);
+        let mut cov = vec![SMatrix::zeros(); FFT_LEN / 2 + 1];
+        cov[BIN] = a_0 * a_0.adjoint();
+        cov[weak_bin] = (a_1 * a_1.adjoint()).scale(1e-3);
+
+        let power = clean_map_equal(&cov, BIN..=weak_bin, 1.0, 40.0, true, true);
+        assert!((power[i_0] - 1.0).abs() < 1e-9, "strong source {}", power[i_0]);
+        assert!((power[i_1] - 1.0).abs() < 1e-9, "weak source {}", power[i_1]);
+        let rest: f64 = power.iter().sum::<f64>() - 2.0;
+        assert!(rest.abs() < 1e-9, "elsewhere {rest}");
+
+        let power = clean_map_equal(&cov, BIN..=weak_bin, 1.0, 20.0, true, true);
+        assert_eq!(power[i_1], 0.0, "weak bin below the threshold");
+    }
+
     /// Two incoherent sources far apart: the strongest clean point of each image half is at
     /// (or next to) its source.
     #[test]
@@ -425,7 +479,7 @@ mod test {
         let scan_grid = test_scan_grid();
         let mic_array = MicArray::uma16();
         let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
-        let clean_sc = CleanSc::new(steering, 0.9, 30, 30.0, 0.0, true);
+        let clean_sc = CleanSc::new(steering, 0.9, 30, 30.0, 0.0, true, false);
 
         let row = scan_grid.height() / 2;
         let (col_1, col_2) = (scan_grid.width() / 6, 5 * scan_grid.width() / 6);

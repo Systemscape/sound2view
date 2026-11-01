@@ -10,11 +10,13 @@ use crate::peaks::Peak;
 pub struct TrackerConfig {
     /// A peak continues a track if it is at most this far away, in grid cells
     pub max_dist_cells: f64,
-    /// Maps in a row with a matching peak until a track counts as confirmed
+    /// Maps with a matching peak until a track counts as confirmed (not in a row: a source at
+    /// the detection limit comes and goes, the misses are limited by `max_missed`)
     pub min_hits: usize,
     /// Maps in a row without a matching peak until a track is dropped
     pub max_missed: usize,
     /// Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly
+    /// (less puts the dot between two spots when the map's maximum jumps, e.g. to a reflection)
     pub smoothing: f64,
 }
 
@@ -24,7 +26,7 @@ impl Default for TrackerConfig {
             max_dist_cells: 6.0,
             min_hits: 3,
             max_missed: 5,
-            smoothing: 0.5,
+            smoothing: 1.0,
         }
     }
 }
@@ -52,11 +54,17 @@ pub struct Track {
     pub row: f64,
     /// Level of the last matching peak relative to the map maximum, in dB
     pub level_db: f64,
-    /// Matching peaks in a row
+    /// Filled by the pipeline: the power arriving coherently from the track over the map band,
+    /// in dB above the noise floor (see [`crate::peaks::PeakConfig::min_above_floor_db`]), and
+    /// the fraction of the received power arriving coherently from it over the band's upper
+    /// part (see [`crate::pipeline::UPPER_BAND_HZ`]), in dB
+    pub source_db: f64,
+    pub source_upper_db: f64,
+    /// Matching peaks since the track started
     pub hits: usize,
     /// Maps in a row without a matching peak (0: seen in the current map)
     pub missed: usize,
-    /// Seen in `min_hits` maps in a row at some point; stays confirmed until dropped
+    /// Seen in `min_hits` maps; stays confirmed until dropped
     pub confirmed: bool,
     /// Delay-and-sum audio toward the track since the previous map, mono at
     /// [`crate::dsp::beam_signal::TRACK_SAMPLE_RATE`]; filled by the pipeline
@@ -129,7 +137,6 @@ impl Tracker {
 
         for (track, matched) in self.tracks.iter_mut().zip(&track_matched) {
             if !matched {
-                track.hits = 0;
                 track.missed += 1;
             }
         }
@@ -142,6 +149,8 @@ impl Tracker {
                 col: peak.col,
                 row: peak.row,
                 level_db: peak.level_db,
+                source_db: 0.0,
+                source_upper_db: 0.0,
                 hits: 1,
                 missed: 0,
                 confirmed: self.config.min_hits <= 1,
@@ -169,10 +178,18 @@ mod test {
         tracker.tracks().iter().map(|t| t.id).collect()
     }
 
+    /// Tracker with position smoothing 0.5
+    fn smoothed() -> Tracker {
+        Tracker::new(TrackerConfig {
+            smoothing: 0.5,
+            ..TrackerConfig::default()
+        })
+    }
+
     /// A moving peak keeps its id; its position follows with the smoothing weight.
     #[test]
     fn moving_peak_keeps_id() {
-        let mut tracker = Tracker::new(TrackerConfig::default());
+        let mut tracker = smoothed();
         tracker.update(&[peak(10.0, 10.0)]);
         tracker.update(&[peak(12.0, 10.0)]);
         tracker.update(&[peak(14.0, 11.0)]);
@@ -196,14 +213,15 @@ mod test {
         assert_eq!(tracker.tracks()[1].missed, 0);
     }
 
-    /// Confirmed after `min_hits` maps in a row, stays confirmed through misses, dropped after
-    /// more than `max_missed`.
+    /// Confirmed after `min_hits` matching maps, also with misses in between, stays confirmed
+    /// through misses, dropped after more than `max_missed`.
     #[test]
     fn confirmation_and_drop() {
         let config = TrackerConfig::default();
         let mut tracker = Tracker::new(config.clone());
         for _ in 0..config.min_hits - 1 {
             tracker.update(&[peak(5.0, 5.0)]);
+            tracker.update(&[]);
         }
         assert!(!tracker.tracks()[0].confirmed);
         tracker.update(&[peak(5.0, 5.0)]);
@@ -220,7 +238,7 @@ mod test {
     /// Two close tracks and two peaks: each peak goes to its nearest track, not both to one.
     #[test]
     fn nearest_pairs_first() {
-        let mut tracker = Tracker::new(TrackerConfig::default());
+        let mut tracker = smoothed();
         tracker.update(&[peak(10.0, 10.0), peak(14.0, 10.0)]);
         // Both new peaks are within the gate of both tracks
         tracker.update(&[peak(13.0, 10.0), peak(11.0, 10.0)]);

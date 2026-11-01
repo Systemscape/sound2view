@@ -3,7 +3,7 @@ use std::{
     ops::{ControlFlow, RangeInclusive},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{Receiver, TrySendError, sync_channel},
     },
     thread,
@@ -11,8 +11,10 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, Rect, RichText, Slider,
-    Stroke, TextureHandle, TextureOptions, pos2,
+    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, PopupCloseBehavior, Pos2,
+    Rect, RichText, Sense, Slider, Stroke, TextureHandle, TextureOptions,
+    containers::menu::{MenuButton, MenuConfig},
+    pos2, vec2,
 };
 use sound2view_core::{
     BoxError, ImageSource, VideoFrame,
@@ -28,8 +30,8 @@ use sound2view_core::{
 
 use crate::{
     config::{BeamformerConfig, CameraConfig, Config, Method},
-    load_speech, run_configured,
-    speech::SpeechStatus,
+    run_configured,
+    speech::{SpeechDetector, SpeechStatus},
     theme,
 };
 
@@ -104,6 +106,9 @@ const NOISE_REMOVAL_HELP: &str = "Subtracts an estimate of the uncorrelated nois
 const EQUAL_BINS_HELP: &str = "Gives every frequency bin the same weight. Otherwise the low \
     bins, where speech has most of its energy but the array has almost no resolution, dominate \
     and the zones get wide. Bins more than 20 dB below the strongest are left out.";
+const CLEAN_EQUAL_BINS_HELP: &str = "Gives every frequency bin with a source the same weight \
+    in the CLEAN-SC map. Otherwise the loudest bins decide, and those are the low ones, where \
+    the array cannot separate a source from its reflection off a wall or the ceiling.";
 const BAND_HELP: &str = "Frequency range summed into the map. Lower frequencies give wider \
     zones (the array is only 12.6 cm wide); above about 4 kHz ghost sources (grating lobes) can \
     appear. For a single tone, narrow the band around it.";
@@ -116,10 +121,20 @@ const MARKER_RADIUS_MIN: f32 = 8.0;
 const MARKER_FONT: f32 = 0.02;
 const MARKER_FONT_MIN: f32 = 15.0;
 
+/// Space between the controls of the top bar, and the width of its sliders
+const GAP: f32 = 12.0;
+const SLIDER_WIDTH: f32 = 80.0;
+/// Band slider: rail width, handle radius and the text to its right
+const BAND_RAIL_WIDTH: f32 = 200.0;
+const BAND_TEXT_WIDTH: f32 = 90.0;
+const HANDLE_RADIUS: f32 = 6.0;
+const SETTINGS_MENU_WIDTH: f32 = 260.0;
+
 /// Slider limits
 const NU_RANGE: RangeInclusive<f64> = 1.0..=100.0;
 const CLEAN_MAX_ITER_RANGE: RangeInclusive<usize> = 1..=30;
-const DB_RANGE_RANGE: RangeInclusive<f64> = 1.0..=20.0;
+const DB_RANGE_RANGE: RangeInclusive<f64> = 0.1..=20.0;
+const SOURCE_RANGE: RangeInclusive<f64> = 0.0..=15.0;
 /// Speech threshold limits
 const SPEECH_THRESHOLD_MIN: f32 = 0.3;
 const SPEECH_THRESHOLD_MAX: f32 = 0.99;
@@ -156,16 +171,18 @@ pub struct App {
     last_map: Option<MapData>,
     /// Overlay range in dB below the map maximum; applies immediately
     db_range: f64,
-    /// Peak search of the pipeline, for the tooltip; `enabled` (show the dots) is toggled in the
-    /// GUI
+    /// Peak search of the pipeline, for the tooltip; `enabled` (show the dots) and
+    /// `min_above_floor_db` (which tracks are shown, applies immediately) are edited in the GUI
     peaks: PeakConfig,
     /// Tracking of the pipeline, for the tooltip
     tracking: TrackerConfig,
-    /// Speech detection on (`speech.enabled`); the threshold slider is shown only then
+    /// Speech detection on (from `speech.enabled`, toggled in the GUI); the threshold slider is
+    /// shown only then
     speech_enabled: bool,
     /// Speech threshold edited in the GUI
     speech_threshold: f32,
-    /// Read by the audio thread once per map, as f32 bits; no pipeline restart
+    /// Read by the audio thread once per map (the threshold as f32 bits); no pipeline restart
+    shared_speech_enabled: Arc<AtomicBool>,
     shared_speech_threshold: Arc<AtomicU32>,
     /// Settings edited in the GUI
     settings: PipelineSettings,
@@ -210,15 +227,16 @@ impl eframe::App for App {
             .frame(top_frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().slider_width = SLIDER_WIDTH;
                     ui.label(RichText::new("sound2view").strong().size(18.0));
-                    ui.add_space(24.0);
-                    self.camera_control(ui);
-                    ui.add_space(16.0);
+                    ui.add_space(GAP);
                     redraw_map |= self.controls(ui);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.settings_menu(ui);
+                        ui.add_space(GAP);
                         status_indicator(ui, &camera_status, "Camera");
-                        ui.add_space(12.0);
+                        ui.add_space(GAP);
                         status_indicator(ui, &audio_status, "Mic");
                     });
                 });
@@ -285,7 +303,9 @@ impl eframe::App for App {
                     if self.peaks.enabled
                         && let Some(map) = &self.last_map
                     {
-                        draw_tracks(painter, rect, map.size, &map.tracks, &map.speech);
+                        let hover = ui.input(|input| input.pointer.hover_pos());
+                        let min_db = self.peaks.min_above_floor_db;
+                        draw_tracks(painter, rect, map.size, &map.tracks, &map.speech, hover, min_db);
                     }
                 }
 
@@ -319,6 +339,7 @@ impl App {
             cameras: Mutex::new(Vec::new()),
         });
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
+        let shared_speech_enabled = Arc::new(AtomicBool::new(config.speech.enabled));
         let shared_speech_threshold =
             Arc::new(AtomicU32::new(config.speech.on_threshold.to_bits()));
 
@@ -334,6 +355,7 @@ impl App {
                 config.clone(),
                 Arc::clone(&shared_settings),
                 Arc::clone(&audio_status),
+                Arc::clone(&shared_speech_enabled),
                 Arc::clone(&shared_speech_threshold),
             ),
             map_texture: None,
@@ -343,6 +365,7 @@ impl App {
             tracking: config.tracking.clone(),
             speech_enabled: config.speech.enabled,
             speech_threshold: config.speech.on_threshold,
+            shared_speech_enabled,
             shared_speech_threshold,
             settings,
             shared_settings,
@@ -392,14 +415,34 @@ impl App {
         }
     }
 
-    /// Beamformer and its parameters, band, overlay range and peak toggle; returns true if the
-    /// overlay needs a redraw
+    /// Rarely changed settings behind a button: the camera and the functional options
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        let config = MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+        MenuButton::new("\u{2699} Settings")
+            .config(config)
+            .ui(ui, |ui| {
+                ui.set_min_width(SETTINGS_MENU_WIDTH);
+                ui.horizontal(|ui| self.camera_control(ui));
+                ui.separator();
+                label(ui, "Functional beamforming");
+                let beamformer = &mut self.settings.beamformer;
+                ui.checkbox(&mut beamformer.functional_noise_removal, "Noise removal")
+                    .on_hover_text(NOISE_REMOVAL_HELP);
+                ui.checkbox(&mut beamformer.functional_equal_bins, "Equal bins")
+                    .on_hover_text(EQUAL_BINS_HELP);
+                label(ui, "CLEAN-SC");
+                ui.checkbox(&mut beamformer.clean_equal_bins, "Equal bins")
+                    .on_hover_text(CLEAN_EQUAL_BINS_HELP);
+            });
+    }
+
+    /// Beamformer with its parameter, band, overlay range, tracks and speech; returns true if
+    /// the overlay needs a redraw
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         let beamformer = &mut self.settings.beamformer;
         let pipeline = &mut self.settings.pipeline;
 
         let method_help = beamformer.method.description();
-        label(ui, "Beamformer").on_hover_text(method_help);
         egui::ComboBox::from_id_salt("method")
             .selected_text(beamformer.method.label())
             .show_ui(ui, |ui| {
@@ -411,11 +454,10 @@ impl App {
             .response
             .on_hover_text(method_help);
 
-        // Parameter of the selected method
+        // Parameter of the selected method (the functional checkboxes are in the settings menu)
         match beamformer.method {
             Method::Das => {}
             Method::Functional => {
-                ui.add_space(16.0);
                 label(ui, "nu").on_hover_text(NU_HELP);
                 ui.add(
                     Slider::new(&mut beamformer.nu, NU_RANGE)
@@ -423,13 +465,8 @@ impl App {
                         .max_decimals(0),
                 )
                 .on_hover_text(NU_HELP);
-                ui.checkbox(&mut beamformer.functional_noise_removal, "Noise removal")
-                    .on_hover_text(NOISE_REMOVAL_HELP);
-                ui.checkbox(&mut beamformer.functional_equal_bins, "Equal bins")
-                    .on_hover_text(EQUAL_BINS_HELP);
             }
             Method::CleanSc => {
-                ui.add_space(16.0);
                 let sources_help = format!(
                     "At most this many sources are removed per frequency bin. More finds weaker \
                      sources, but also more reflections. Bins whose strongest point is more than \
@@ -445,64 +482,71 @@ impl App {
             }
         }
 
-        ui.add_space(16.0);
-        label(ui, "Band").on_hover_text(BAND_HELP);
-        // Each end is limited by the other, so the band never collapses
-        ui.add(
-            Slider::new(
-                &mut pipeline.f_lo_hz,
-                F_MIN_HZ..=pipeline.f_hi_hz - MIN_BAND_HZ,
-            )
-            .logarithmic(true)
-            .suffix(" Hz")
-            .max_decimals(0),
-        )
-        .on_hover_text(BAND_HELP);
-        ui.add(
-            Slider::new(
-                &mut pipeline.f_hi_hz,
-                pipeline.f_lo_hz + MIN_BAND_HZ..=F_MAX_HZ,
-            )
-            .logarithmic(true)
-            .suffix(" Hz")
-            .max_decimals(0),
-        )
-        .on_hover_text(BAND_HELP);
+        ui.add_space(GAP);
+        band_slider(ui, &mut pipeline.f_lo_hz, &mut pipeline.f_hi_hz).on_hover_text(BAND_HELP);
 
-        ui.add_space(16.0);
+        ui.add_space(GAP);
         label(ui, "Overlay").on_hover_text(OVERLAY_HELP);
         let db_range_changed = ui
             .add(
                 Slider::new(&mut self.db_range, DB_RANGE_RANGE)
+                    .logarithmic(true)
                     .suffix(" dB")
                     .max_decimals(1),
             )
             .on_hover_text(OVERLAY_HELP)
             .changed();
 
-        ui.add_space(16.0);
+        ui.add_space(GAP);
         ui.checkbox(&mut self.peaks.enabled, "Tracks")
             .on_hover_text(format!(
                 "Dots at the tracked sources: local maxima of the map within {} dB of the \
-                 loudest point, at least {} grid cells apart, at most {}, followed from map to \
-                 map. A dot appears after {} maps in a row and stays up to {} maps after its \
-                 peak is gone. Green: the audio from its direction is classified as speech. The \
-                 label is the track number, the level relative to the loudest point and the \
-                 speech probability.",
+                 loudest point, at least {} grid cells apart, at most {}, from whose direction \
+                 at least {} dB more power arrives coherently than from any direction in silence \
+                 (the noise floor, learned from the quietest map of the last minute; a steady \
+                 background source is part of it), \
+                 followed from map to map. A dot appears after {} maps in a row and stays up to \
+                 {} maps after its peak is gone. Green: the audio from its direction is \
+                 classified as speech. The label is the track number, the level relative to \
+                 the loudest point and the speech probability; hover over a dot for its \
+                 coherence above the noise floor and above 2 kHz.",
                 self.peaks.range_db,
                 self.peaks.min_dist_cells,
                 self.peaks.max_count,
+                self.peaks.min_above_floor_db,
                 self.tracking.min_hits,
                 self.tracking.max_missed
             ));
 
+        if self.peaks.enabled {
+            let source_help = "How much louder (coherent power from its direction) a source \
+                must be than the quietest moment of the last minute to get a dot. Lower it if \
+                a talker gets no dot, raise it if dots appear on nothing. Applies immediately.";
+            label(ui, "Above floor").on_hover_text(source_help);
+            ui.add(
+                Slider::new(&mut self.peaks.min_above_floor_db, SOURCE_RANGE)
+                    .suffix(" dB")
+                    .max_decimals(0),
+            )
+            .on_hover_text(source_help);
+        }
+
+        ui.add_space(GAP);
+        let speech_help = "Classify the audio from each track as speech (green dot). Off: no \
+            classifier runs.";
+        if ui
+            .checkbox(&mut self.speech_enabled, "Speech")
+            .on_hover_text(speech_help)
+            .changed()
+        {
+            self.shared_speech_enabled
+                .store(self.speech_enabled, Ordering::Relaxed);
+        }
         if self.speech_enabled {
-            ui.add_space(16.0);
             let help = "Speech probability (smoothed) at which a track turns green. It stays \
                 green for speech.hold_ms after the last time the probability was this high. Raise \
                 it if noise or music turns green, lower it if speech stays blue. Applies \
                 immediately.";
-            label(ui, "Speech").on_hover_text(help);
             let changed = ui
                 .add(
                     Slider::new(
@@ -522,19 +566,25 @@ impl App {
     }
 }
 
-/// Dot with id and level per confirmed track; `rect` is where the map is drawn, `size` its grid
-/// size
+/// Dot with id and level per confirmed track at least `min_above_floor_db` above the noise
+/// floor, with its coherence details while the pointer (`hover`) is on the dot; `rect` is where
+/// the map is drawn, `size` its grid size
 fn draw_tracks(
     painter: &egui::Painter,
     rect: Rect,
     [width, height]: [usize; 2],
     tracks: &[Track],
     speech: &HashMap<u64, SpeechStatus>,
+    hover: Option<Pos2>,
+    min_above_floor_db: f64,
 ) {
     let radius = (MARKER_RADIUS * rect.height()).max(MARKER_RADIUS_MIN);
     let font = FontId::proportional((MARKER_FONT * rect.height()).max(MARKER_FONT_MIN));
     let shade = Color32::from_black_alpha(170);
-    for track in tracks.iter().filter(|track| track.confirmed) {
+    let shown = tracks
+        .iter()
+        .filter(|track| track.confirmed && track.source_db >= min_above_floor_db);
+    for track in shown {
         // Grid cell centers at (col + 0.5) / width of the image
         let x = rect.left() + (track.col as f32 + 0.5) / width as f32 * rect.width();
         let y = rect.top() + (track.row as f32 + 0.5) / height as f32 * rect.height();
@@ -567,6 +617,12 @@ fn draw_tracks(
         } else if let Some(source) = status.and_then(|s| s.echo_of) {
             text += &format!("  echo of #{source}");
         }
+        if hover.is_some_and(|pos| pos.distance(center) <= 2.0 * radius) {
+            text += &format!(
+                "  |  {:+.0} dB above the noise floor, {:.0} dB coherent above 2 kHz",
+                track.source_db, track.source_upper_db
+            );
+        }
         // Label on a pill: green with dark text for speech, dark with white text otherwise
         let (pill, text_color) = if is_speech {
             (theme::SPEECH, theme::BACKGROUND)
@@ -583,6 +639,60 @@ fn draw_tracks(
         painter.rect_filled(pill_rect, 0.3 * font.size, pill);
         painter.galley(min + padding, galley, text_color);
     }
+}
+
+/// Both band limits on one slider with two handles (log scale from `F_MIN_HZ` to `F_MAX_HZ`),
+/// the values to its right. A drag or click moves the nearer handle; each end stays
+/// `MIN_BAND_HZ` from the other.
+fn band_slider(ui: &mut egui::Ui, f_lo: &mut f64, f_hi: &mut f64) -> egui::Response {
+    let size = vec2(BAND_RAIL_WIDTH + BAND_TEXT_WIDTH, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let rail = Rect::from_x_y_ranges(
+        rect.left() + HANDLE_RADIUS..=rect.left() + BAND_RAIL_WIDTH - HANDLE_RADIUS,
+        rect.center().y - 2.0..=rect.center().y + 2.0,
+    );
+    let log_span = (F_MAX_HZ / F_MIN_HZ).ln();
+    let to_x = |f: f64| rail.left() + ((f / F_MIN_HZ).ln() / log_span) as f32 * rail.width();
+    let to_f = |x: f32| {
+        let t = ((x - rail.left()) / rail.width()).clamp(0.0, 1.0) as f64;
+        F_MIN_HZ * (t * log_span).exp()
+    };
+
+    // The handle nearer to the pointer when the interaction starts is the one that moves
+    let handle_id = response.id.with("upper handle");
+    if let Some(pos) = response.interact_pointer_pos() {
+        if response.drag_started() || response.clicked() {
+            let upper = (pos.x - to_x(*f_hi)).abs() < (pos.x - to_x(*f_lo)).abs();
+            ui.data_mut(|data| data.insert_temp(handle_id, upper));
+        }
+        if response.dragged() || response.clicked() {
+            let upper = ui.data(|data| data.get_temp::<bool>(handle_id)).unwrap_or(false);
+            let f = to_f(pos.x);
+            if upper {
+                *f_hi = f.clamp(*f_lo + MIN_BAND_HZ, F_MAX_HZ);
+            } else {
+                *f_lo = f.clamp(F_MIN_HZ, *f_hi - MIN_BAND_HZ);
+            }
+        }
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rail, 2.0, ui.visuals().widgets.inactive.bg_fill);
+    let (x_lo, x_hi) = (to_x(*f_lo), to_x(*f_hi));
+    let selected = Rect::from_x_y_ranges(x_lo..=x_hi, rail.y_range());
+    painter.rect_filled(selected, 2.0, theme::ACCENT);
+    for x in [x_lo, x_hi] {
+        let center = pos2(x, rail.center().y);
+        painter.circle(center, HANDLE_RADIUS, Color32::WHITE, Stroke::new(1.0, theme::ACCENT));
+    }
+    painter.text(
+        pos2(rect.left() + BAND_RAIL_WIDTH + 6.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        format!("{f_lo:.0}-{f_hi:.0} Hz"),
+        FontId::proportional(14.0),
+        theme::TEXT,
+    );
+    response
 }
 
 /// Muted label in front of a control
@@ -721,14 +831,17 @@ fn spawn_audio(
     mut config: Config,
     settings: Arc<Mutex<PipelineSettings>>,
     status: Arc<Mutex<DeviceStatus>>,
+    speech_enabled: Arc<AtomicBool>,
     speech_threshold: Arc<AtomicU32>,
 ) -> Receiver<MapData> {
     let (tx, rx) = sync_channel(1);
 
     thread::spawn(move || {
         let sample_rate = config.audio.sample_rate as f64;
-        // Loaded once; reset for every pipeline run, since track ids start over
-        let mut speech = load_speech(&config.speech);
+        // Loaded when first enabled and kept (reset per pipeline run, since track ids start
+        // over); stays `None` after a failed load
+        let mut speech: Option<SpeechDetector> = None;
+        let mut speech_failed = false;
 
         loop {
             let mut mic =
@@ -756,12 +869,24 @@ fn spawn_audio(
                               layout: &MapLayout,
                               tracks: &[Track]|
                  -> Result<ControlFlow<()>, BoxError> {
+                        let enabled = speech_enabled.load(Ordering::Relaxed);
+                        if enabled && speech.is_none() && !speech_failed {
+                            speech = SpeechDetector::load(&config.speech)
+                                .inspect_err(|e| eprintln!("No speech detection: {e}"))
+                                .ok();
+                            speech_failed = speech.is_none();
+                        }
                         let speech = match &mut speech {
-                            Some(detector) => {
+                            Some(detector) if enabled => {
                                 let threshold = speech_threshold.load(Ordering::Relaxed);
                                 detector.set_on_threshold(f32::from_bits(threshold));
                                 detector.update(tracks)?;
                                 detector.statuses()
+                            }
+                            // Off: forget the tracks, so that turning it on starts fresh
+                            Some(detector) => {
+                                detector.reset();
+                                HashMap::new()
                             }
                             None => HashMap::new(),
                         };

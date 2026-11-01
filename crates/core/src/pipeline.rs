@@ -1,6 +1,7 @@
 //! Processing chain after the `FrameSource`: STFT, covariance, beamformer and map output.
 
 use std::{
+    collections::VecDeque,
     io,
     ops::{ControlFlow, RangeInclusive},
     time::Instant,
@@ -12,7 +13,7 @@ use crate::{
     BoxError, FrameSource,
     dsp::{
         beam_signal::{BeamSignal, TRACK_SAMPLE_RATE, decimation_factor},
-        beamformer::{Beamformer, Steering},
+        beamformer::{Beamformer, Steering, coherent_and_received_power, source_fraction},
         covariance::SlidingCovariance,
         stft::{Stft, StftStream},
     },
@@ -55,6 +56,23 @@ impl Default for PipelineConfig {
     }
 }
 
+/// Lower end of the upper part of the map band, in Hz: from here on the 12.6 cm array resolves
+/// directions (a source 30 degrees off the beam is attenuated), below every beam carries every
+/// source. [`Track::source_upper_db`] is measured here.
+pub const UPPER_BAND_HZ: f64 = 2000.0;
+
+/// The noise floor of the source check is learned over this many seconds of maps: per map the
+/// largest coherent power over a coarse subgrid (every `FLOOR_STRIDE`th cell), of which the
+/// lowest is the floor (minimum statistics), so that the quietest moment sets it: the pauses
+/// between words of a talker are enough, whatever happens in the rest of the window. Power, not
+/// the fraction of the received power:
+/// a steady background source (fan) has a fraction near 1 in silence, so no fraction could be
+/// above it, but a talker has more power. With uncorrelated noise the coherent power
+/// fluctuates around zero, so a single point (such as the map maximum) is useless in dB; the
+/// largest of about 30 points is a stable statistic.
+pub const FLOOR_WINDOW_S: f64 = 60.0;
+const FLOOR_STRIDE: usize = 8;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error("invalid pipeline config: {0}")]
@@ -94,8 +112,16 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     stream: StftStream<M>,
     cov: SlidingCovariance<M>,
     beamformer: B,
-    /// Bins summed in the power map
+    /// Bins summed in the power map, and the ones of them from `UPPER_BAND_HZ` on (all of them
+    /// if the band ends below)
     bins: RangeInclusive<usize>,
+    upper_bins: RangeInclusive<usize>,
+    /// Steering of the scan grid, for the source check of peaks and tracks
+    steering: Steering<M>,
+    /// Largest coherent power over the subgrid per map (linear, > 0), for the last
+    /// `floor_window` maps, see `FLOOR_WINDOW_S`
+    floor_samples: VecDeque<f64>,
+    floor_window: usize,
     /// One map every this many STFT frames
     map_every: usize,
     /// Layout of the power map
@@ -161,6 +187,12 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
         let bin_lo = (config.f_lo_hz / df).round() as usize;
         let bin_hi = ((config.f_hi_hz / df).round() as usize).min(n_bins - 1);
         let bins = bin_lo..=bin_hi;
+        let bin_upper = (UPPER_BAND_HZ / df).round() as usize;
+        let upper_bins = if bin_upper > bin_lo && bin_upper <= bin_hi {
+            bin_upper..=bin_hi
+        } else {
+            bins.clone()
+        };
 
         println!(
             "Grid {}x{}, bins {bins:?}, memory {} frames, map every {} frames",
@@ -191,16 +223,19 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
             }
         };
 
+        let steering = Steering::new(&scan_grid, &MicArray::uma16(), sample_rate, config.fft_len);
         Ok(Self {
             stream: StftStream::new(stft),
             cov: SlidingCovariance::new(n_bins, config.memory_frames),
-            beamformer: make_beamformer(Steering::new(
-                &scan_grid,
-                &MicArray::uma16(),
-                sample_rate,
-                config.fft_len,
-            )),
+            beamformer: make_beamformer(steering.clone()),
             bins,
+            upper_bins,
+            steering,
+            floor_samples: VecDeque::new(),
+            floor_window: (FLOOR_WINDOW_S * sample_rate
+                / (config.map_every * config.fft_len / 2) as f64)
+                .ceil()
+                .max(1.0) as usize,
             map_every: config.map_every,
             layout: MapLayout {
                 camera,
@@ -216,13 +251,74 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
 }
 
 impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
-    /// Continue the tracks with the peaks of `power`, hand each track the audio of its beam since
-    /// the previous map, then point the beams at the new track positions.
+    /// Index of the grid cell nearest to (col, row)
+    fn point(&self, col: f64, row: f64) -> usize {
+        let [width, height] = [self.layout.grid_width, self.layout.grid_height];
+        let col = (col.round().max(0.0) as usize).min(width - 1);
+        let row = (row.round().max(0.0) as usize).min(height - 1);
+        row * width + col
+    }
+
+    /// Power arriving coherently from `point` over the map band, see
+    /// [`coherent_and_received_power`]
+    fn coherent_power(&self, point: usize) -> f64 {
+        coherent_and_received_power(self.cov.estimate(), self.bins.clone(), &self.steering, point).0
+    }
+
+    /// Coherent power from the cell nearest to (col, row) in dB above `floor`
+    fn above_floor_db(&self, col: f64, row: f64, floor: f64) -> f64 {
+        10.0 * (self.coherent_power(self.point(col, row)).max(1e-30) / floor).log10()
+    }
+
+    /// Noise floor (linear): the lowest of `floor_samples`, infinite without samples
+    fn floor(&self) -> f64 {
+        self.floor_samples.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    /// Continue the tracks with the peaks of `power`, measure each track's coherent power above
+    /// the noise floor, hand each track the audio of its beam since the previous map, then
+    /// point the beams at the new track positions.
     fn update_tracks(&mut self, power: &[f64]) {
         let size = [self.layout.grid_width, self.layout.grid_height];
-        self.tracker.update(&find_peaks(power, size, &self.peaks));
+        let peaks = find_peaks(power, size, &self.peaks);
+        // The current map is part of the floor window; no sample without any coherent power
+        // (e.g. a source that delivers zeros)
+        let [width, height] = size;
+        let sample = (FLOOR_STRIDE / 2..height)
+            .step_by(FLOOR_STRIDE)
+            .flat_map(|row| {
+                let cols = (FLOOR_STRIDE / 2..width).step_by(FLOOR_STRIDE);
+                cols.map(move |col| row * width + col)
+            })
+            .map(|point| self.coherent_power(point))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if sample > 0.0 {
+            if self.floor_samples.len() >= self.floor_window {
+                self.floor_samples.pop_front();
+            }
+            self.floor_samples.push_back(sample);
+        }
+        let floor = self.floor();
+        self.tracker.update(&peaks);
 
+        let source_dbs: Vec<(f64, f64)> = self
+            .tracker
+            .tracks()
+            .iter()
+            .map(|track| {
+                let point = self.point(track.col, track.row);
+                let cov = self.cov.estimate();
+                let upper = source_fraction(cov, self.upper_bins.clone(), &self.steering, point);
+                let above = self.above_floor_db(track.col, track.row, floor);
+                (above, 10.0 * upper.max(1e-10).log10())
+            })
+            .collect();
         let tracks = self.tracker.tracks_mut();
+        for (track, (source_db, source_upper_db)) in tracks.iter_mut().zip(source_dbs) {
+            track.source_db = source_db;
+            track.source_upper_db = source_upper_db;
+        }
+
         self.beams.retain(|(id, _)| tracks.iter().any(|track| track.id == *id));
         let Some(audio) = &self.track_audio else {
             return;
@@ -316,11 +412,11 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
 
 #[cfg(test)]
 mod test {
-    use std::{f64::consts::PI, ops::ControlFlow};
+    use std::{f64::consts::PI, io, ops::ControlFlow};
 
     use super::{Pipeline, PipelineConfig, run};
     use crate::{
-        Point3,
+        FrameSource, Point3,
         dsp::{
             beam_signal::TRACK_SAMPLE_RATE,
             beamformer::clean_sc::CleanSc,
@@ -347,9 +443,36 @@ mod test {
         2.0 * (c * c + s * s).sqrt() / signal.len() as f64
     }
 
-    /// Two sines on the focus plane: two confirmed tracks at the sources, each with audio in
-    /// which its own source dominates. CLEAN-SC, because the broad DAS main lobes of the two
-    /// sources overlap and pull both peaks about two cells toward each other.
+    /// Mic noise alone at `level_db` for `duration_s`
+    fn noise_scene(level_db: f64, duration_s: f64, seed: u64) -> Scene {
+        Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s,
+            mic_noise_params: MicNoiseParams { seed, level_db },
+            sources: Vec::new(),
+        }
+    }
+
+    /// `0` until it ends, then `1`
+    struct Chain(Simulator<16>, Simulator<16>);
+
+    impl FrameSource<16> for Chain {
+        fn sample_rate(&self) -> f64 {
+            self.0.sample_rate()
+        }
+
+        fn read(&mut self, buf: &mut [f64]) -> io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => self.1.read(buf),
+                frames => Ok(frames),
+            }
+        }
+    }
+
+    /// Two sines on the focus plane after two quiet seconds (the noise floor needs a quiet map):
+    /// two confirmed tracks at the sources, each with audio in which its own source dominates.
+    /// CLEAN-SC, because the broad DAS main lobes of the two sources overlap and pull both peaks
+    /// about two cells toward each other.
     #[test]
     fn tracks_follow_sources_with_their_audio() {
         let config = PipelineConfig::default();
@@ -372,7 +495,8 @@ mod test {
                 })
                 .collect(),
         };
-        let mut sim = Simulator::new(scene, MicArray::uma16()).unwrap();
+        let quiet = Simulator::new(noise_scene(20.0, 2.0, 3), MicArray::uma16()).unwrap();
+        let mut sim = Chain(quiet, Simulator::new(scene, MicArray::uma16()).unwrap());
         let camera = test_camera();
         let pipeline = Pipeline::new(
             SAMPLE_RATE,
@@ -380,7 +504,7 @@ mod test {
             &PeakConfig::default(),
             &TrackerConfig::default(),
             camera.clone(),
-            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
         )
         .unwrap();
 
@@ -400,7 +524,9 @@ mod test {
         })
         .unwrap();
 
-        let confirmed: Vec<&Track> = last.iter().filter(|t| t.confirmed).collect();
+        let min_db = PeakConfig::default().min_above_floor_db;
+        let confirmed: Vec<&Track> =
+            last.iter().filter(|t| t.confirmed && t.source_db >= min_db).collect();
         assert_eq!(confirmed.len(), 2, "tracks: {last:?}");
 
         let intrinsics = &camera.intrinsics;
@@ -421,6 +547,12 @@ mod test {
             let dist = (track.col - col).hypot(track.row - row);
             assert!(dist < 1.0, "track at ({}, {}), source at ({col}, {row})", track.col, track.row);
 
+            // Each source gets about half of the received power, far above the quiet maps
+            let above = track.source_db;
+            assert!(above > 10.0, "track {}: {above} dB above the floor", track.id);
+            let upper = track.source_upper_db;
+            assert!(upper > -5.0, "track {}: {upper} dB coherent above 2 kHz", track.id);
+
             let (_, samples) = audio.iter().find(|(id, _)| *id == track.id).unwrap();
             // At least a second of audio
             assert!(samples.len() > TRACK_SAMPLE_RATE as usize, "{} samples", samples.len());
@@ -430,5 +562,87 @@ mod test {
             // sidelobe pattern (near a null at 3.5 kHz, not at 3 kHz)
             assert!(own_db > 8.0, "track {}: own source {own_db:.1} dB above the other", track.id);
         }
+    }
+
+    /// Mic noise alone, loud: every map has a maximum, but the coherent power from it stays at
+    /// the noise floor, so no track would be shown.
+    #[test]
+    fn noise_alone_gives_no_tracks() {
+        let mut sim = Simulator::new(noise_scene(80.0, 6.0, 2), MicArray::uma16()).unwrap();
+        let pipeline = Pipeline::new(
+            SAMPLE_RATE,
+            &PipelineConfig::default(),
+            &PeakConfig::default(),
+            &TrackerConfig::default(),
+            test_camera(),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
+        )
+        .unwrap();
+
+        let min_db = PeakConfig::default().min_above_floor_db;
+        let mut maps = 0;
+        run(&mut sim, pipeline, |_power, _layout, tracks| {
+            assert!(tracks.iter().all(|t| t.source_db < min_db), "map {maps}: {tracks:?}");
+            maps += 1;
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert!(maps > 50, "{maps} maps");
+    }
+
+    /// A steady source from the start is the noise floor (no dot: a fan in a real room), a
+    /// source 14 dB louder that appears later gets a track.
+    #[test]
+    fn steady_background_is_the_floor() {
+        let fan = Point3::new(-0.5, -0.3, 2.0);
+        let talker = Point3::new(0.6, 0.2, 2.0);
+        let source = |pos, amplitude| Source {
+            pos,
+            signal: Signal::Sine(Sine::new(amplitude, 3000.0, 0.0)),
+        };
+        let scene = |sources: Vec<Source>, seed| Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s: 2.0,
+            mic_noise_params: MicNoiseParams {
+                seed,
+                level_db: 40.0,
+            },
+            sources,
+        };
+        let only_fan = Simulator::new(scene(vec![source(fan, 0.2)], 4), MicArray::uma16()).unwrap();
+        let both = scene(vec![source(fan, 0.2), source(talker, 1.0)], 5);
+        let mut sim = Chain(only_fan, Simulator::new(both, MicArray::uma16()).unwrap());
+        let pipeline = Pipeline::new(
+            SAMPLE_RATE,
+            &PipelineConfig::default(),
+            &PeakConfig::default(),
+            &TrackerConfig::default(),
+            test_camera(),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
+        )
+        .unwrap();
+
+        let min_db = PeakConfig::default().min_above_floor_db;
+        let (mut maps, mut confirmed) = (0, Vec::new());
+        run(&mut sim, pipeline, |_power, _layout, tracks| {
+            // The first second is the fan alone (18 maps); then the talker starts
+            if maps < 17 {
+                assert!(tracks.iter().all(|t| t.source_db < min_db), "map {maps}: {tracks:?}");
+            }
+            confirmed = tracks
+                .iter()
+                .filter(|t| t.confirmed && t.source_db >= min_db)
+                .cloned()
+                .collect();
+            maps += 1;
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+        let track = &confirmed[0];
+        // +x is left in the image (`Mount` turns the camera 180 degrees about z): the talker at
+        // x = 0.6 is at about column 25, the fan at -0.5 at about 38
+        assert!(track.col < 30.0, "track at col {}", track.col);
+        assert!(track.source_db > 10.0, "{} dB above the floor", track.source_db);
     }
 }

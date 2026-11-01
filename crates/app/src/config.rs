@@ -202,6 +202,9 @@ pub struct BeamformerConfig {
     pub clean_stop_db: f64,
     /// CLEAN-SC: standard deviation of the Gaussian clean beam in grid cells (0: single points)
     pub clean_beam_cells: f64,
+    /// CLEAN-SC: divide each bin's clean map by its maximum before summing (every bin with a
+    /// source has the same say; otherwise the loudest, lowest bins decide)
+    pub clean_equal_bins: bool,
 }
 
 impl Default for BeamformerConfig {
@@ -215,6 +218,7 @@ impl Default for BeamformerConfig {
             clean_max_iter: 10,
             clean_stop_db: 20.0,
             clean_beam_cells: 1.5,
+            clean_equal_bins: true,
         }
     }
 }

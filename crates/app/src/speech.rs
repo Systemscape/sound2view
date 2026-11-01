@@ -44,6 +44,12 @@ pub struct SpeechConfig {
     pub gain_db: f32,
     /// Classifier frames quieter than this (after `gain_db`) count as non-speech, in dBFS
     pub min_level_db: f32,
+    /// A track is speech only while at least this fraction (in dB) of the power received above
+    /// 2 kHz arrives coherently from it (`Track::source_upper_db`). Below about 1.5 kHz, where
+    /// most speech energy is, the array has no directivity and every beam carries every talker,
+    /// so the classifier alone cannot tell whose speech a beam carries; above 2 kHz a talker
+    /// elsewhere leaks in at the sidelobe level only.
+    pub min_source_db: f64,
 }
 
 impl Default for SpeechConfig {
@@ -60,6 +66,7 @@ impl Default for SpeechConfig {
             max_shift_cells: 3.0,
             gain_db: 36.0,
             min_level_db: -55.0,
+            min_source_db: -6.0,
         }
     }
 }
@@ -82,8 +89,8 @@ impl SpeechConfig {
         if self.echo_correlation.is_nan() || self.echo_correlation < 0.0 {
             return Err("speech.echo_correlation must be >= 0".to_string());
         }
-        if !self.echo_margin_db.is_finite() {
-            return Err("speech.echo_margin_db must be finite".to_string());
+        if !self.echo_margin_db.is_finite() || self.min_source_db.is_nan() {
+            return Err("speech: echo_margin_db must be finite, min_source_db a number".to_string());
         }
         Ok(())
     }
@@ -129,10 +136,10 @@ pub struct SpeechStatus {
 
 /// Smoothing and hysteresis of the classifier output: speech starts when the smoothed
 /// probability has been at `on_threshold` for `onset_frames` and ends `hold_frames` after the
-/// last frame that reached it. Only
-/// such frames re-arm the hold, so a sound the classifier finds half speech-like (clapping after
-/// speech, same track) cannot keep it on. Speech also ends when the track moves more than
-/// `max_shift_cells` from where it last reached `on_threshold` (another source took it over).
+/// last frame that reached it. Only such frames re-arm the hold, so a sound the classifier finds
+/// half speech-like (clapping after speech, same track) cannot keep it on. Speech also ends when
+/// the track moves more than `max_shift_cells` from where it last reached `on_threshold`
+/// (another source took it over).
 #[derive(Default)]
 struct Hysteresis {
     status: SpeechStatus,
@@ -265,6 +272,8 @@ impl SpeechDetector {
         let mut samples = Vec::new();
 
         for track in tracks {
+            // Leaked speech from a talker elsewhere: not speech, whatever the classifier says
+            let present = track.source_upper_db >= self.config.min_source_db;
             let state = self.tracks.entry(track.id).or_insert_with(|| TrackSpeech {
                 preprocessor: Preprocessor::new(),
                 hysteresis: Hysteresis::default(),
@@ -285,6 +294,7 @@ impl SpeechDetector {
             let features = frames.into_iter().map(|frame| frame.features).collect();
             let probabilities = self.model.predict(features)?;
             for (probability, rms) in probabilities.into_iter().zip(rms) {
+                let probability = if present { probability } else { 0.0 };
                 state
                     .hysteresis
                     .update(probability, rms, [track.col, track.row], &params);
@@ -421,6 +431,8 @@ mod test {
             col: 0.0,
             row: 0.0,
             level_db,
+            source_db: 0.0,
+            source_upper_db: 0.0,
             hits: 1,
             missed: 0,
             confirmed: true,
@@ -658,6 +670,20 @@ mod test {
                 "track {id}: speech in {} maps together, {alone} alone",
                 together[id]
             );
+        }
+    }
+
+    /// Speech that does not arrive from the track's direction (a talker elsewhere leaking into
+    /// the beam) is not speech.
+    #[test]
+    fn leaked_speech_is_not_speech() {
+        let mut detector = SpeechDetector::load(&config()).unwrap();
+        for chunk in speech_fixture().chunks(1707) {
+            let mut track = track(chunk);
+            track.source_upper_db = -12.0;
+            detector.update(&[track]).unwrap();
+            let status = detector.status(0).unwrap_or_default();
+            assert!(!status.speech && status.probability == 0.0, "{status:?}");
         }
     }
 
