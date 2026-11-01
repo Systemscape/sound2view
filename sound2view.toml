@@ -87,3 +87,19 @@ min_hits = 3
 max_missed = 5
 # Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly
 smoothing = 0.5
+
+[speech]
+# Classify the audio of each track (voice-activity-detection model); speech tracks are green
+enabled = true
+# Model exported by voice-activity-detection, relative to the working directory
+model = "model/speech_detector.json"
+# Smoothed probability at which a track counts as speech (adjustable in the GUI)
+threshold = 0.9
+# A track stays speech while the smoothed probability is above threshold - release; below
+# threshold
+release = 0.15
+# Speech is held this long after the probability fell below threshold - release, in ms
+hangover_ms = 300.0
+# Classifier frames quieter than this count as non-speech (dB of the beam signal: full scale at
+# the mic, referenced to 1 m)
+min_level_db = -55.0

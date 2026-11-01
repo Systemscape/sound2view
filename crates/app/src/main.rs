@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     error::Error,
     fs::{self, File},
@@ -27,10 +27,14 @@ use sound2view_core::{
     tracking::Track,
 };
 
-use crate::config::{CONFIG_PATH, Config, Method};
+use crate::{
+    config::{CONFIG_PATH, Config, Method},
+    speech::{SpeechConfig, SpeechDetector},
+};
 
 mod config;
 mod gui;
+mod speech;
 mod theme;
 
 /// Number of maps written in mic mode, unless given as argument
@@ -123,7 +127,8 @@ fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     let sample_rate = scene.sample_rate;
     let mut sim = Simulator::new(scene, MicArray::uma16())?;
 
-    let on_map = save_maps(src_pos, None, config.peaks.enabled);
+    let speech = load_speech(&config.speech);
+    let on_map = save_maps(src_pos, None, config.peaks.enabled, speech);
     run_configured(&mut sim, sample_rate, config, on_map)?;
     Ok(())
 }
@@ -141,7 +146,12 @@ fn run_mic(config: &Config, maps: usize) -> Result<(), Box<dyn Error>> {
         &mut mic,
         sample_rate,
         config,
-        save_maps(Vec::new(), Some(maps), config.peaks.enabled),
+        save_maps(
+            Vec::new(),
+            Some(maps),
+            config.peaks.enabled,
+            load_speech(&config.speech),
+        ),
     )?;
 
     println!("dropped {} chunks", mic.dropped());
@@ -196,21 +206,55 @@ fn run_configured<S: FrameSource<16>>(
     }
 }
 
+/// Speech detector from `config`; `None` if disabled or the model does not load (with a note)
+pub fn load_speech(config: &SpeechConfig) -> Option<SpeechDetector> {
+    if !config.enabled {
+        return None;
+    }
+    SpeechDetector::load(config)
+        .inspect_err(|e| eprintln!("No speech detection: {e}"))
+        .ok()
+}
+
 /// Map handler for `run`: writes each map as `map_NNN.png` with a red cross per `src_pos` and a
-/// blue dot per confirmed track (if `show_tracks`), and the audio of each confirmed track to
-/// `track_NNN.wav` (see [`TrackRecorder`]).
+/// dot per confirmed track (if `show_tracks`; green if classified as speech by `speech`), and
+/// the audio of each confirmed track to `track_NNN.wav` (see [`TrackRecorder`]). Prints when a
+/// confirmed track starts or stops being speech.
 ///
 /// Stops after `max_maps` maps; `None` runs until the stream ends.
 fn save_maps(
     src_pos: Vec<Point3>,
     max_maps: Option<usize>,
     show_tracks: bool,
+    mut speech: Option<SpeechDetector>,
 ) -> impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError> {
     let mut i = 0;
     let mut recorder = TrackRecorder::default();
+    let mut talking: HashSet<u64> = HashSet::new();
     move |power, layout, tracks| {
+        let mut speech_ids = Vec::new();
+        if let Some(detector) = &mut speech {
+            detector.update(tracks)?;
+            for track in tracks.iter().filter(|track| track.confirmed) {
+                let is_speech = detector.status(track.id).is_some_and(|s| s.speech);
+                if is_speech {
+                    speech_ids.push(track.id);
+                }
+                if is_speech != talking.contains(&track.id) {
+                    let change = if is_speech { "speech" } else { "no speech" };
+                    println!("map {i}: track #{} {change}", track.id);
+                    if is_speech {
+                        talking.insert(track.id);
+                    } else {
+                        talking.remove(&track.id);
+                    }
+                }
+            }
+        }
+
         let shown = if show_tracks { tracks } else { &[] };
-        render::map_image(power, layout, &src_pos, shown).save(format!("map_{i:03}.png"))?;
+        render::map_image(power, layout, &src_pos, shown, &speech_ids)
+            .save(format!("map_{i:03}.png"))?;
         recorder.record(tracks)?;
         i += 1;
         if max_maps.is_some_and(|max| i >= max) {

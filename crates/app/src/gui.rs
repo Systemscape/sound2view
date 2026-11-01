@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     ops::{ControlFlow, RangeInclusive},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
         mpsc::{Receiver, TrySendError, sync_channel},
     },
     thread,
@@ -26,7 +28,9 @@ use sound2view_core::{
 
 use crate::{
     config::{BeamformerConfig, CameraConfig, Config, Method},
-    run_configured, theme,
+    load_speech, run_configured,
+    speech::SpeechStatus,
+    theme,
 };
 
 /// State of the camera or the mic, set by its thread and shown in the GUI
@@ -113,6 +117,9 @@ const PEAK_FONT_SIZE: f32 = 14.0;
 const NU_RANGE: RangeInclusive<f64> = 1.0..=100.0;
 const CLEAN_MAX_ITER_RANGE: RangeInclusive<usize> = 1..=30;
 const DB_RANGE_RANGE: RangeInclusive<f64> = 1.0..=20.0;
+/// Speech threshold limits; the lower one is also kept above `speech.release`, so speech can end
+const SPEECH_THRESHOLD_MIN: f32 = 0.3;
+const SPEECH_THRESHOLD_MAX: f32 = 0.99;
 /// Band limits in Hz; above about 6 kHz grating lobes appear in the image
 const F_MIN_HZ: f64 = 100.0;
 const F_MAX_HZ: f64 = 6000.0;
@@ -133,6 +140,8 @@ struct MapData {
     power: Vec<f64>,
     /// Tracks of this map, without their audio
     tracks: Vec<Track>,
+    /// Speech state per track id; empty without speech detection
+    speech: HashMap<u64, SpeechStatus>,
 }
 
 pub struct App {
@@ -149,6 +158,14 @@ pub struct App {
     peaks: PeakConfig,
     /// Tracking of the pipeline, for the tooltip
     tracking: TrackerConfig,
+    /// Speech detection on (`speech.enabled`); the threshold slider is shown only then
+    speech_enabled: bool,
+    /// `speech.release`, lower limit of the threshold slider
+    speech_release: f32,
+    /// Speech threshold edited in the GUI
+    speech_threshold: f32,
+    /// Read by the audio thread once per map, as f32 bits; no pipeline restart
+    shared_speech_threshold: Arc<AtomicU32>,
     /// Settings edited in the GUI
     settings: PipelineSettings,
     /// Settings read by the audio thread; updated from `settings` when no slider is dragged
@@ -267,7 +284,7 @@ impl eframe::App for App {
                     if self.peaks.enabled
                         && let Some(map) = &self.last_map
                     {
-                        draw_tracks(painter, rect, map.size, &map.tracks);
+                        draw_tracks(painter, rect, map.size, &map.tracks, &map.speech);
                     }
                 }
 
@@ -301,6 +318,7 @@ impl App {
             cameras: Mutex::new(Vec::new()),
         });
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
+        let shared_speech_threshold = Arc::new(AtomicU32::new(config.speech.threshold.to_bits()));
 
         Self {
             rx: spawn_camera(
@@ -314,12 +332,17 @@ impl App {
                 config.clone(),
                 Arc::clone(&shared_settings),
                 Arc::clone(&audio_status),
+                Arc::clone(&shared_speech_threshold),
             ),
             map_texture: None,
             last_map: None,
             db_range: config.display.db_range,
             peaks: config.peaks.clone(),
             tracking: config.tracking.clone(),
+            speech_enabled: config.speech.enabled,
+            speech_release: config.speech.release,
+            speech_threshold: config.speech.threshold,
+            shared_speech_threshold,
             settings,
             shared_settings,
             camera,
@@ -457,19 +480,39 @@ impl App {
             .changed();
 
         ui.add_space(16.0);
-        ui.checkbox(&mut self.peaks.enabled, "Sources")
+        ui.checkbox(&mut self.peaks.enabled, "Tracks")
             .on_hover_text(format!(
-                "Blue dots at the tracked sources: local maxima of the map within {} dB of the \
+                "Dots at the tracked sources: local maxima of the map within {} dB of the \
                  loudest point, at least {} grid cells apart, at most {}, followed from map to \
                  map. A dot appears after {} maps in a row and stays up to {} maps after its \
-                 peak is gone. The label is the track number and the level relative to the \
-                 loudest point.",
+                 peak is gone. Green: the audio from its direction is classified as speech. The \
+                 label is the track number, the level relative to the loudest point and the \
+                 speech probability.",
                 self.peaks.range_db,
                 self.peaks.min_dist_cells,
                 self.peaks.max_count,
                 self.tracking.min_hits,
                 self.tracking.max_missed
             ));
+
+        if self.speech_enabled {
+            ui.add_space(16.0);
+            let help = "Speech probability (smoothed) at which a track turns green. Raise it if \
+                noise or music turns green, lower it if speech stays blue. Applies immediately.";
+            label(ui, "Speech").on_hover_text(help);
+            let min = SPEECH_THRESHOLD_MIN.max(self.speech_release + 0.05);
+            let changed = ui
+                .add(
+                    Slider::new(&mut self.speech_threshold, min..=SPEECH_THRESHOLD_MAX)
+                        .max_decimals(2),
+                )
+                .on_hover_text(help)
+                .changed();
+            if changed {
+                self.shared_speech_threshold
+                    .store(self.speech_threshold.to_bits(), Ordering::Relaxed);
+            }
+        }
         db_range_changed
     }
 }
@@ -481,6 +524,7 @@ fn draw_tracks(
     rect: Rect,
     [width, height]: [usize; 2],
     tracks: &[Track],
+    speech: &HashMap<u64, SpeechStatus>,
 ) {
     let font = FontId::proportional(PEAK_FONT_SIZE);
     for track in tracks.iter().filter(|track| track.confirmed) {
@@ -488,16 +532,21 @@ fn draw_tracks(
         let x = rect.left() + (track.col as f32 + 0.5) / width as f32 * rect.width();
         let y = rect.top() + (track.row as f32 + 0.5) / height as f32 * rect.height();
         let center = pos2(x, y);
-        painter.circle(
-            center,
-            PEAK_RADIUS,
-            theme::PEAK,
-            Stroke::new(2.0, Color32::WHITE),
-        );
+        let status = speech.get(&track.id);
+        let fill = if status.is_some_and(|s| s.speech) {
+            theme::SPEECH
+        } else {
+            theme::PEAK
+        };
+        painter.circle(center, PEAK_RADIUS, fill, Stroke::new(2.0, Color32::WHITE));
+        let mut text = format!("#{} {:.1} dB", track.id, track.level_db);
+        if let Some(status) = status {
+            text += &format!(" {:.0} %", 100.0 * status.probability);
+        }
         painter.text(
             pos2(x + PEAK_RADIUS + 4.0, y),
             Align2::LEFT_CENTER,
-            format!("#{} {:.1} dB", track.id, track.level_db),
+            text,
             font.clone(),
             Color32::WHITE,
         );
@@ -640,11 +689,14 @@ fn spawn_audio(
     mut config: Config,
     settings: Arc<Mutex<PipelineSettings>>,
     status: Arc<Mutex<DeviceStatus>>,
+    speech_threshold: Arc<AtomicU32>,
 ) -> Receiver<MapData> {
     let (tx, rx) = sync_channel(1);
 
     thread::spawn(move || {
         let sample_rate = config.audio.sample_rate as f64;
+        // Loaded once; reset for every pipeline run, since track ids start over
+        let mut speech = load_speech(&config.speech);
 
         loop {
             let mut mic =
@@ -664,11 +716,23 @@ fn spawn_audio(
                 config.beamformer = current.beamformer.clone();
                 config.pipeline = current.pipeline.clone();
                 let mut gui_closed = false;
+                if let Some(detector) = &mut speech {
+                    detector.reset();
+                }
 
                 let on_map = |power: &[f64],
                               layout: &MapLayout,
                               tracks: &[Track]|
                  -> Result<ControlFlow<()>, BoxError> {
+                        let speech = match &mut speech {
+                            Some(detector) => {
+                                let threshold = speech_threshold.load(Ordering::Relaxed);
+                                detector.set_threshold(f32::from_bits(threshold));
+                                detector.update(tracks)?;
+                                detector.statuses()
+                            }
+                            None => HashMap::new(),
+                        };
                         let tracks = tracks
                             .iter()
                             .map(|track| Track {
@@ -680,6 +744,7 @@ fn spawn_audio(
                             size: [layout.grid_width, layout.grid_height],
                             power: power.to_vec(),
                             tracks,
+                            speech,
                         };
                         match tx.try_send(map) {
                             Ok(()) => ctx.request_repaint(),

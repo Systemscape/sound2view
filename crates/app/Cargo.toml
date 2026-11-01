@@ -12,5 +12,7 @@ sound2view-core = { path = "../core" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 eframe = "0.37.0"
 hound = "3.5.1"
+# Speech classifier (lib: Preprocessor + Model); its package also builds burn and eframe 0.36
+voice-activity-detection = { git = "ssh://git@github.com/Systemscape/voice-activity-detection.git", rev = "5f9346de6b1e295613c96559b149bf41acbab9dc" }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 toml = { version = "1.1.8", default-features = false, features = ["std", "serde", "parse"] }

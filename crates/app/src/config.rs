@@ -11,6 +11,8 @@ use sound2view_core::{
     tracking::TrackerConfig,
 };
 
+use crate::speech::SpeechConfig;
+
 /// Config file, looked up in the working directory
 pub const CONFIG_PATH: &str = "sound2view.toml";
 
@@ -24,6 +26,7 @@ pub struct Config {
     pub display: DisplayConfig,
     pub peaks: PeakConfig,
     pub tracking: TrackerConfig,
+    pub speech: SpeechConfig,
 }
 
 impl Config {
@@ -268,6 +271,7 @@ impl Config {
             );
         }
         self.tracking.validate()?;
+        self.speech.validate()?;
         if self.display.db_range <= 0.0 {
             return Err("display.db_range must be > 0".to_string());
         }
