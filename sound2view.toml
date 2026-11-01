@@ -42,6 +42,11 @@ f_hi_hz = 4100.0
 grid_width = 64
 # Focus distance in meters
 grid_z = 2.0
+# Leave impulsive sounds (snapping, clapping, a hammer) out of the map entirely (toggle in the
+# settings menu). Off, they are shown like any other source but can never be speech: a hand
+# snapping next to a talker is inside the beam toward the talker, both beams carry the same audio,
+# and only a second map without the snaps tells them apart
+skip_transients = false
 
 [beamformer]
 # "das", "functional" or "clean_sc" (selectable in the GUI)
@@ -75,8 +80,9 @@ db_range = 3.0
 # Local maxima of each map, followed as tracks (see [tracking])
 # Show the tracks as dots (toggle "Tracks" in the GUI)
 enabled = true
-# Only maxima at most this many dB below the map maximum
-range_db = 6.0
+# Only maxima at most this many dB below the map maximum (a talker next to snapping is about
+# 10 dB below it; whether a peak is a source at all is decided against the noise floor)
+range_db = 12.0
 # Minimum distance between two peaks in grid cells; the weaker one is dropped
 min_dist_cells = 4.0
 # At most this many peaks, strongest first
@@ -126,7 +132,8 @@ max_shift_cells = 3.0
 gain_db = 36.0
 # Classifier frames quieter than this (after gain_db) count as non-speech, in dBFS
 min_level_db = -55.0
-# A track is speech only while at least this fraction (dB) of the power received above 2 kHz
-# arrives coherently from it: below 2 kHz every beam carries every talker, so a talker elsewhere
-# (also outside the image) would turn other tracks green
+# A track is speech only while its share (dB) of the power received above 2 kHz that the other
+# tracks do not explain is at least this: below 2 kHz every beam carries every talker, so a
+# talker elsewhere (also outside the image) would turn other tracks green; a loud track next to
+# the talker (snapping) does not hide the talker's share
 min_source_db = -6.0

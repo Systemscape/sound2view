@@ -56,10 +56,14 @@ pub struct Track {
     pub level_db: f64,
     /// Filled by the pipeline: the power arriving coherently from the track over the map band,
     /// in dB above the noise floor (see [`crate::peaks::PeakConfig::min_above_floor_db`]), and
-    /// the fraction of the received power arriving coherently from it over the band's upper
-    /// part (see [`crate::pipeline::UPPER_BAND_HZ`]), in dB
+    /// its share of the power received over the band's upper part (see
+    /// [`crate::pipeline::UPPER_BAND_HZ`]) that the other tracks do not explain, in dB
     pub source_db: f64,
     pub source_upper_db: f64,
+    /// Also a peak of the map without transient frames (see
+    /// [`crate::pipeline::PipelineConfig::skip_transients`]): a continuous sound, not snapping
+    /// or clapping; filled by the pipeline. Only steady tracks can be speech.
+    pub steady: bool,
     /// Matching peaks since the track started
     pub hits: usize,
     /// Maps in a row without a matching peak (0: seen in the current map)
@@ -151,6 +155,7 @@ impl Tracker {
                 level_db: peak.level_db,
                 source_db: 0.0,
                 source_upper_db: 0.0,
+                steady: false,
                 hits: 1,
                 missed: 0,
                 confirmed: self.config.min_hits <= 1,

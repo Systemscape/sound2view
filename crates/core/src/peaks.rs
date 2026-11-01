@@ -8,7 +8,9 @@ use serde::Deserialize;
 pub struct PeakConfig {
     /// Show peaks at all
     pub enabled: bool,
-    /// Only local maxima at most this many dB below the map maximum
+    /// Only local maxima at most this many dB below the map maximum (a talker next to snapping
+    /// is about 10 dB below it; whether a peak is a source at all is decided against the noise
+    /// floor, see `min_above_floor_db`)
     pub range_db: f64,
     /// Minimum distance between two peaks in grid cells; the weaker one is dropped
     pub min_dist_cells: f64,
@@ -28,7 +30,7 @@ impl Default for PeakConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            range_db: 6.0,
+            range_db: 12.0,
             min_dist_cells: 4.0,
             max_count: 5,
             min_above_floor_db: 8.0,

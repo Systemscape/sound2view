@@ -44,11 +44,11 @@ pub struct SpeechConfig {
     pub gain_db: f32,
     /// Classifier frames quieter than this (after `gain_db`) count as non-speech, in dBFS
     pub min_level_db: f32,
-    /// A track is speech only while at least this fraction (in dB) of the power received above
-    /// 2 kHz arrives coherently from it (`Track::source_upper_db`). Below about 1.5 kHz, where
-    /// most speech energy is, the array has no directivity and every beam carries every talker,
-    /// so the classifier alone cannot tell whose speech a beam carries; above 2 kHz a talker
-    /// elsewhere leaks in at the sidelobe level only.
+    /// A track is speech only while its share of the power received above 2 kHz that the other
+    /// tracks do not explain (`Track::source_upper_db`) is at least this, in dB. Below about
+    /// 1.5 kHz, where most speech energy is, the array has no directivity and every beam
+    /// carries every talker, so the classifier alone cannot tell whose speech a beam carries;
+    /// above 2 kHz a talker elsewhere leaks in at the sidelobe level only.
     pub min_source_db: f64,
 }
 
@@ -272,8 +272,10 @@ impl SpeechDetector {
         let mut samples = Vec::new();
 
         for track in tracks {
-            // Leaked speech from a talker elsewhere: not speech, whatever the classifier says
-            let present = track.source_upper_db >= self.config.min_source_db;
+            // An impulsive source (snapping next to the talker: its beam carries the talker's
+            // speech) or leaked speech from a talker elsewhere: not speech, whatever the
+            // classifier says
+            let present = track.steady && track.source_upper_db >= self.config.min_source_db;
             let state = self.tracks.entry(track.id).or_insert_with(|| TrackSpeech {
                 preprocessor: Preprocessor::new(),
                 hysteresis: Hysteresis::default(),
@@ -433,6 +435,7 @@ mod test {
             level_db,
             source_db: 0.0,
             source_upper_db: 0.0,
+            steady: true,
             hits: 1,
             missed: 0,
             confirmed: true,
@@ -674,16 +677,19 @@ mod test {
     }
 
     /// Speech that does not arrive from the track's direction (a talker elsewhere leaking into
-    /// the beam) is not speech.
+    /// the beam), or an impulsive track (snapping next to the talker), is not speech.
     #[test]
-    fn leaked_speech_is_not_speech() {
-        let mut detector = SpeechDetector::load(&config()).unwrap();
-        for chunk in speech_fixture().chunks(1707) {
-            let mut track = track(chunk);
-            track.source_upper_db = -12.0;
-            detector.update(&[track]).unwrap();
-            let status = detector.status(0).unwrap_or_default();
-            assert!(!status.speech && status.probability == 0.0, "{status:?}");
+    fn leaked_speech_and_impulsive_tracks_are_not_speech() {
+        for (upper_db, steady) in [(-12.0, true), (0.0, false)] {
+            let mut detector = SpeechDetector::load(&config()).unwrap();
+            for chunk in speech_fixture().chunks(1707) {
+                let mut track = track(chunk);
+                track.source_upper_db = upper_db;
+                track.steady = steady;
+                detector.update(&[track]).unwrap();
+                let status = detector.status(0).unwrap_or_default();
+                assert!(!status.speech && status.probability == 0.0, "{status:?}");
+            }
         }
     }
 

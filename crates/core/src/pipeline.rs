@@ -7,13 +7,14 @@ use std::{
     time::Instant,
 };
 
+use nalgebra::SVector;
 use serde::Deserialize;
 
 use crate::{
-    BoxError, FrameSource,
+    BoxError, Complex64, FrameSource,
     dsp::{
         beam_signal::{BeamSignal, TRACK_SAMPLE_RATE, decimation_factor},
-        beamformer::{Beamformer, Steering, coherent_and_received_power, source_fraction},
+        beamformer::{Beamformer, Steering, coherent_and_received_power},
         covariance::SlidingCovariance,
         stft::{Stft, StftStream},
     },
@@ -40,6 +41,11 @@ pub struct PipelineConfig {
     pub grid_width: u32,
     /// Focus distance of the scan grid in meters
     pub grid_z: f64,
+    /// Leave impulsive sounds (snapping, clapping, a hammer) out of the map entirely: STFT
+    /// frames whose energy jumps `TRANSIENT_DB` above the recent median are not accumulated.
+    /// Off, they are shown like any other source, but a second, steady map without those
+    /// frames decides which tracks can be speech (`Track::steady`).
+    pub skip_transients: bool,
 }
 
 impl Default for PipelineConfig {
@@ -52,6 +58,7 @@ impl Default for PipelineConfig {
             f_hi_hz: 4100.0,
             grid_width: 64,
             grid_z: 2.0,
+            skip_transients: false,
         }
     }
 }
@@ -72,6 +79,20 @@ pub const UPPER_BAND_HZ: f64 = 2000.0;
 /// largest of about 30 points is a stable statistic.
 pub const FLOOR_WINDOW_S: f64 = 60.0;
 const FLOOR_STRIDE: usize = 8;
+/// The power a track's upper-band share is measured against is the received power minus what
+/// the other tracks explain, but at least this fraction of it (the share is boosted by at most
+/// 10 dB when loud tracks explain almost everything)
+const UPPER_UNEXPLAINED_MIN: f64 = 0.1;
+/// An STFT frame is a transient if its energy over the map band is this far above the median
+/// of the last `TRANSIENT_HISTORY` frames (0.26 s at 48 kHz; at least `TRANSIENT_MIN_HISTORY`
+/// of them). Speech varies by less than 10 dB within that time; the first frames of a sound
+/// after silence count as transients until the median has caught up (about 0.13 s).
+const TRANSIENT_DB: f64 = 10.0;
+const TRANSIENT_HISTORY: usize = 24;
+const TRANSIENT_MIN_HISTORY: usize = 8;
+/// A track is steady if the steady map (without transient frames) has a peak within
+/// `peaks.min_dist_cells` of it that is at most this far below that map's maximum
+const STEADY_RANGE_DB: f64 = 6.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -111,6 +132,11 @@ impl PipelineConfig {
 pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     stream: StftStream<M>,
     cov: SlidingCovariance<M>,
+    /// Like `cov`, without the transient frames; decides which tracks are steady (speech
+    /// candidates). With a 12.6 cm array a hand snapping next to a talker is inside the beam
+    /// toward the talker at every speech frequency, so both beams carry the same audio and no
+    /// audio test can tell the snapping track from the talker; a map without the snaps can.
+    steady_cov: SlidingCovariance<M>,
     beamformer: B,
     /// Bins summed in the power map, and the ones of them from `UPPER_BAND_HZ` on (all of them
     /// if the band ends below)
@@ -121,6 +147,10 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     /// Largest coherent power over the subgrid per map (linear, > 0), for the last
     /// `floor_window` maps, see `FLOOR_WINDOW_S`
     floor_samples: VecDeque<f64>,
+    /// Energy over the map band of the last `TRANSIENT_HISTORY` STFT frames, for the transient
+    /// check; unused without `skip_transients`
+    skip_transients: bool,
+    frame_energies: VecDeque<f64>,
     floor_window: usize,
     /// One map every this many STFT frames
     map_every: usize,
@@ -227,11 +257,14 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
         Ok(Self {
             stream: StftStream::new(stft),
             cov: SlidingCovariance::new(n_bins, config.memory_frames),
+            steady_cov: SlidingCovariance::new(n_bins, config.memory_frames),
             beamformer: make_beamformer(steering.clone()),
             bins,
             upper_bins,
             steering,
             floor_samples: VecDeque::new(),
+            skip_transients: config.skip_transients,
+            frame_energies: VecDeque::new(),
             floor_window: (FLOOR_WINDOW_S * sample_rate
                 / (config.map_every * config.fft_len / 2) as f64)
                 .ceil()
@@ -275,12 +308,18 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
         self.floor_samples.iter().copied().fold(f64::INFINITY, f64::min)
     }
 
-    /// Continue the tracks with the peaks of `power`, measure each track's coherent power above
+    /// Continue the tracks with the peaks of `power`, mark the ones with a peak in `steady`
+    /// (the map without transient frames) as steady, measure each track's coherent power above
     /// the noise floor, hand each track the audio of its beam since the previous map, then
     /// point the beams at the new track positions.
-    fn update_tracks(&mut self, power: &[f64]) {
+    fn update_tracks(&mut self, power: &[f64], steady: &[f64]) {
         let size = [self.layout.grid_width, self.layout.grid_height];
         let peaks = find_peaks(power, size, &self.peaks);
+        let steady_config = PeakConfig {
+            range_db: STEADY_RANGE_DB,
+            ..self.peaks.clone()
+        };
+        let steady_peaks = find_peaks(steady, size, &steady_config);
         // The current map is part of the floor window; no sample without any coherent power
         // (e.g. a source that delivers zeros)
         let [width, height] = size;
@@ -301,22 +340,37 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
         let floor = self.floor();
         self.tracker.update(&peaks);
 
-        let source_dbs: Vec<(f64, f64)> = self
-            .tracker
-            .tracks()
+        let cov = self.cov.estimate();
+        let tracks = self.tracker.tracks();
+        let above: Vec<f64> = tracks
+            .iter()
+            .map(|track| self.above_floor_db(track.col, track.row, floor))
+            .collect();
+        let upper: Vec<(f64, f64)> = tracks
             .iter()
             .map(|track| {
                 let point = self.point(track.col, track.row);
-                let cov = self.cov.estimate();
-                let upper = source_fraction(cov, self.upper_bins.clone(), &self.steering, point);
-                let above = self.above_floor_db(track.col, track.row, floor);
-                (above, 10.0 * upper.max(1e-10).log10())
+                coherent_and_received_power(cov, self.upper_bins.clone(), &self.steering, point)
             })
             .collect();
+        // Mean mic power over the upper bins, the same for every track
+        let received = upper.first().map_or(0.0, |&(_, received)| received);
+        let coherent_sum: f64 = upper.iter().map(|&(coherent, _)| coherent.max(0.0)).sum();
+
+        let min_dist = self.peaks.min_dist_cells;
         let tracks = self.tracker.tracks_mut();
-        for (track, (source_db, source_upper_db)) in tracks.iter_mut().zip(source_dbs) {
-            track.source_db = source_db;
-            track.source_upper_db = source_upper_db;
+        for ((track, above), &(coherent, _)) in tracks.iter_mut().zip(above).zip(&upper) {
+            track.steady = steady_peaks
+                .iter()
+                .any(|peak| (peak.col - track.col).hypot(peak.row - track.row) <= min_dist);
+            // The track's share of the upper-band power that the other tracks do not explain:
+            // a loud source next to a talker (snapping) would otherwise hide the talker's share,
+            // while a talker outside the image, who is no track, still shows as leakage
+            let others = coherent_sum - coherent.max(0.0);
+            let unexplained = (received - others).max(received * UPPER_UNEXPLAINED_MIN);
+            let share = if unexplained > 0.0 { coherent / unexplained } else { 0.0 };
+            track.source_db = above;
+            track.source_upper_db = 10.0 * share.max(1e-10).log10();
         }
 
         self.beams.retain(|(id, _)| tracks.iter().any(|track| track.id == *id));
@@ -360,6 +414,7 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
     let mut buf = vec![0.0; 1024 * M];
     let mut total_frames = 0;
     let mut out = vec![0.0; pipeline.beamformer.n_points()];
+    let mut steady = vec![0.0; pipeline.beamformer.n_points()];
     let mut map_index = 0;
     // STFT frames since the last map
     let mut new_frames = 0;
@@ -372,9 +427,17 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
         total_frames += frames;
 
         // Closures capture disjoint fields, so `stream`, `cov` and `beams` can be borrowed
-        // together
+        // together. Transients stay out of the steady covariance (and of the map with
+        // `skip_transients`), not out of the beams (the audio).
+        let bins = pipeline.bins.clone();
         pipeline.stream.push(&buf[..frames * M], |snapshots, _l| {
-            pipeline.cov.accumulate(snapshots);
+            let transient = is_transient(&mut pipeline.frame_energies, &snapshots[bins.clone()]);
+            if !transient {
+                pipeline.steady_cov.accumulate(snapshots);
+            }
+            if !(transient && pipeline.skip_transients) {
+                pipeline.cov.accumulate(snapshots);
+            }
             for (_, beam) in &mut pipeline.beams {
                 beam.push_frame(snapshots);
             }
@@ -386,6 +449,14 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             pipeline
                 .beamformer
                 .power_map(pipeline.cov.estimate(), pipeline.bins.clone(), &mut out);
+            // The steady map is the map itself when the transients are skipped anyway, or
+            // before a steady frame arrived
+            if pipeline.skip_transients || pipeline.steady_cov.count() == 0 {
+                steady.copy_from_slice(&out);
+            } else {
+                let cov = pipeline.steady_cov.estimate();
+                pipeline.beamformer.power_map(cov, pipeline.bins.clone(), &mut steady);
+            }
             println!(
                 "map {map_index}: power_map {:.1} ms",
                 start.elapsed().as_secs_f64() * 1e3
@@ -394,7 +465,7 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             new_frames = 0;
             map_index += 1;
 
-            pipeline.update_tracks(&out);
+            pipeline.update_tracks(&out, &steady);
             let flow = on_map(&out, &pipeline.layout, pipeline.tracker.tracks())
                 .map_err(PipelineError::MapHandler)?;
             if flow.is_break() {
@@ -408,6 +479,24 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
         total_frames as f64 / source.sample_rate()
     );
     Ok(())
+}
+
+/// Whether the frame with the band snapshots `snapshots` is a transient, see `TRANSIENT_DB`;
+/// records its energy in `history` either way
+fn is_transient<const M: usize>(
+    history: &mut VecDeque<f64>,
+    snapshots: &[SVector<Complex64, M>],
+) -> bool {
+    let energy: f64 = snapshots.iter().map(|x| x.norm_squared()).sum();
+    let mut sorted: Vec<f64> = history.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let transient = sorted.len() >= TRANSIENT_MIN_HISTORY
+        && energy > sorted[sorted.len() / 2] * 10f64.powf(TRANSIENT_DB / 10.0);
+    if history.len() >= TRANSIENT_HISTORY {
+        history.pop_front();
+    }
+    history.push_back(energy);
+    transient
 }
 
 #[cfg(test)]
@@ -426,7 +515,7 @@ mod test {
         source::simulator::{
             Simulator,
             scene::{MicNoiseParams, Scene, Source},
-            signal::{Signal, Sine},
+            signal::{Noise, NoiseParams, Signal, Sine},
         },
         test_util::{SAMPLE_RATE, test_camera},
         tracking::{Track, TrackerConfig},
@@ -454,9 +543,9 @@ mod test {
     }
 
     /// `0` until it ends, then `1`
-    struct Chain(Simulator<16>, Simulator<16>);
+    struct Chain<A, B>(A, B);
 
-    impl FrameSource<16> for Chain {
+    impl<A: FrameSource<16>, B: FrameSource<16>> FrameSource<16> for Chain<A, B> {
         fn sample_rate(&self) -> f64 {
             self.0.sample_rate()
         }
@@ -588,6 +677,170 @@ mod test {
         })
         .unwrap();
         assert!(maps > 50, "{maps} maps");
+    }
+
+    /// `talker` plus `hand` snapping: the hand's sound times a decaying envelope (8 ms) every
+    /// 300 ms, the same for all mics (the inter-mic delays are far shorter)
+    struct Snapping {
+        talker: Simulator<16>,
+        hand: Simulator<16>,
+        hand_buf: Vec<f64>,
+        n: u64,
+    }
+
+    impl FrameSource<16> for Snapping {
+        fn sample_rate(&self) -> f64 {
+            self.talker.sample_rate()
+        }
+
+        fn read(&mut self, buf: &mut [f64]) -> io::Result<usize> {
+            let frames = self.talker.read(buf)?;
+            self.hand_buf.resize(frames * 16, 0.0);
+            let hand_frames = self.hand.read(&mut self.hand_buf)?;
+            for frame in 0..hand_frames {
+                let t = (self.n + frame as u64) as f64 / SAMPLE_RATE;
+                let envelope = (-(t % 0.3) / 0.008).exp();
+                for m in 0..16 {
+                    buf[frame * 16 + m] += envelope * self.hand_buf[frame * 16 + m];
+                }
+            }
+            self.n += frames as u64;
+            Ok(frames)
+        }
+    }
+
+    /// Snapping (loud band noise in 8 ms bursts) next to a talker: with `skip_transients` the
+    /// snaps stay out of the map, only the talker is a track; without, the hand is one too,
+    /// but not a steady one (inside the beam toward the talker its audio is the talker's: no
+    /// way to tell them apart by sound).
+    #[test]
+    fn transients_are_not_steady() {
+        let scene = |pos, signal| Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s: 3.0,
+            mic_noise_params: MicNoiseParams {
+                seed: 8,
+                level_db: 40.0,
+            },
+            sources: vec![Source { pos, signal }],
+        };
+        let talker = scene(
+            Point3::new(0.6, 0.2, 2.0),
+            Signal::Sine(Sine::new(1.0, 3000.0, 0.0)),
+        );
+        let hand = scene(
+            Point3::new(-0.2, 0.2, 2.0),
+            Signal::Noise(Noise::from(NoiseParams {
+                seed: 11,
+                n_components: 200,
+                f_lo_hz: 1000.0,
+                f_hi_hz: 6000.0,
+                level_db: 110.0,
+            })),
+        );
+        let min_db = PeakConfig::default().min_above_floor_db;
+
+        let mut shown_cols = Vec::new();
+        for skip_transients in [true, false] {
+            let config = PipelineConfig {
+                skip_transients,
+                ..PipelineConfig::default()
+            };
+            let quiet = Simulator::new(noise_scene(40.0, 1.0, 9), MicArray::uma16()).unwrap();
+            let snapping = Snapping {
+                talker: Simulator::new(talker.clone(), MicArray::uma16()).unwrap(),
+                hand: Simulator::new(hand.clone(), MicArray::uma16()).unwrap(),
+                hand_buf: Vec::new(),
+                n: 0,
+            };
+            let mut sim = Chain(quiet, snapping);
+            let pipeline = Pipeline::new(
+                SAMPLE_RATE,
+                &config,
+                &PeakConfig::default(),
+                &TrackerConfig::default(),
+                test_camera(),
+                |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
+            )
+            .unwrap();
+            let mut last = Vec::new();
+            run(&mut sim, pipeline, |_power, _layout, tracks| {
+                last = tracks.to_vec();
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap();
+            let mut shown: Vec<(f64, bool)> = last
+                .iter()
+                .filter(|t| t.confirmed && t.source_db >= min_db)
+                .map(|t| (t.col, t.steady))
+                .collect();
+            shown.sort_by(|a, b| a.0.total_cmp(&b.0));
+            shown_cols.push(shown);
+        }
+
+        // Talker at about column 25, hand at about 34 (+x is left in the image)
+        let [with_skip, without] = [&shown_cols[0], &shown_cols[1]];
+        assert_eq!(with_skip.len(), 1, "with skip: {with_skip:?}");
+        assert!(with_skip[0].0 < 28.0 && with_skip[0].1, "with skip: {with_skip:?}");
+        assert_eq!(without.len(), 2, "without: {without:?}");
+        assert!(without[0].0 < 28.0 && without[0].1, "talker: {without:?}");
+        assert!(without[1].0 > 30.0 && !without[1].1, "hand: {without:?}");
+    }
+
+    /// A talker next to a source 10 dB louder in the same band (snapping): both are tracks,
+    /// and the talker's upper-band share is measured against the power the snapping does not
+    /// explain, so it stays near 0 dB (about -10 dB against all received power).
+    #[test]
+    fn louder_neighbor_does_not_hide_talker() {
+        // 0.8 m apart (9 grid cells): closer, the clean beam merges the two spots
+        let talker = Point3::new(0.6, 0.2, 2.0);
+        let snapping = Point3::new(-0.2, 0.2, 2.0);
+        let scene = Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s: 2.0,
+            mic_noise_params: MicNoiseParams {
+                seed: 6,
+                level_db: 40.0,
+            },
+            sources: vec![
+                Source {
+                    pos: talker,
+                    signal: Signal::Sine(Sine::new(1.0, 3000.0, 0.0)),
+                },
+                Source {
+                    pos: snapping,
+                    signal: Signal::Sine(Sine::new(3.2, 3500.0, 0.0)),
+                },
+            ],
+        };
+        let quiet = Simulator::new(noise_scene(40.0, 1.0, 7), MicArray::uma16()).unwrap();
+        let mut sim = Chain(quiet, Simulator::new(scene, MicArray::uma16()).unwrap());
+        let pipeline = Pipeline::new(
+            SAMPLE_RATE,
+            &PipelineConfig::default(),
+            &PeakConfig::default(),
+            &TrackerConfig::default(),
+            test_camera(),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
+        )
+        .unwrap();
+
+        let mut last = Vec::new();
+        run(&mut sim, pipeline, |_power, _layout, tracks| {
+            last = tracks.to_vec();
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        // The talker at x = 0.6 is left of the snapping at x = -0.2 (+x is left in the image)
+        let confirmed: Vec<&Track> = last.iter().filter(|t| t.confirmed).collect();
+        assert_eq!(confirmed.len(), 2, "{} confirmed tracks", confirmed.len());
+        let talker_track = confirmed
+            .iter()
+            .min_by(|a, b| a.col.total_cmp(&b.col))
+            .unwrap();
+        assert!(talker_track.col < 28.0, "talker track at col {}", talker_track.col);
+        let upper = talker_track.source_upper_db;
+        assert!(upper > -4.0, "talker's upper-band share {upper} dB");
     }
 
     /// A steady source from the start is the noise floor (no dot: a fan in a real room), a

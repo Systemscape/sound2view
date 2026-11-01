@@ -109,6 +109,10 @@ const EQUAL_BINS_HELP: &str = "Gives every frequency bin the same weight. Otherw
 const CLEAN_EQUAL_BINS_HELP: &str = "Gives every frequency bin with a source the same weight \
     in the CLEAN-SC map. Otherwise the loudest bins decide, and those are the low ones, where \
     the array cannot separate a source from its reflection off a wall or the ceiling.";
+const SKIP_TRANSIENTS_HELP: &str = "Leaves impulsive sounds (snapping, clapping, a hammer) out \
+    of the map entirely. Off, they are shown like any other source, but can never be speech: \
+    a hand snapping next to a talker is inside the beam toward the talker, both carry the same \
+    audio, and only a map without the snaps tells them apart.";
 const BAND_HELP: &str = "Frequency range summed into the map. Lower frequencies give wider \
     zones (the array is only 12.6 cm wide); above about 4 kHz ghost sources (grating lobes) can \
     appear. For a single tone, narrow the band around it.";
@@ -433,6 +437,10 @@ impl App {
                 label(ui, "CLEAN-SC");
                 ui.checkbox(&mut beamformer.clean_equal_bins, "Equal bins")
                     .on_hover_text(CLEAN_EQUAL_BINS_HELP);
+                ui.separator();
+                label(ui, "Map");
+                ui.checkbox(&mut self.settings.pipeline.skip_transients, "Skip transients")
+                    .on_hover_text(SKIP_TRANSIENTS_HELP);
             });
     }
 
@@ -619,8 +627,10 @@ fn draw_tracks(
         }
         if hover.is_some_and(|pos| pos.distance(center) <= 2.0 * radius) {
             text += &format!(
-                "  |  {:+.0} dB above the noise floor, {:.0} dB coherent above 2 kHz",
-                track.source_db, track.source_upper_db
+                "  |  {:+.0} dB above the noise floor, {:.0} dB coherent above 2 kHz{}",
+                track.source_db,
+                track.source_upper_db,
+                if track.steady { "" } else { ", impulsive" }
             );
         }
         // Label on a pill: green with dark text for speech, dark with white text otherwise
