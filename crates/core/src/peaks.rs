@@ -8,21 +8,32 @@ use serde::Deserialize;
 pub struct PeakConfig {
     /// Show peaks at all
     pub enabled: bool,
-    /// Only local maxima at most this many dB below the map maximum
+    /// Only local maxima at most this many dB below the map maximum (a talker next to snapping
+    /// is about 10 dB below it; whether a peak is a source at all is decided against the noise
+    /// floor, see `min_above_floor_db`)
     pub range_db: f64,
     /// Minimum distance between two peaks in grid cells; the weaker one is dropped
     pub min_dist_cells: f64,
     /// At most this many peaks, strongest first
     pub max_count: usize,
+    /// A track is shown (and recorded) only if the power arriving coherently from its direction
+    /// (see [`crate::dsp::beamformer::coherent_and_received_power`]) is at least this many dB
+    /// above the noise floor: the most coherent power from any direction while nothing is
+    /// there, learned from the quietest map of the last minute (see
+    /// [`crate::pipeline::FLOOR_WINDOW_S`]). A steady background source (fan) is the floor and
+    /// gets no dot. The pipeline measures it (`Track::source_db`); the app applies it when
+    /// showing tracks, so that it can change without a restart.
+    pub min_above_floor_db: f64,
 }
 
 impl Default for PeakConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            range_db: 6.0,
+            range_db: 12.0,
             min_dist_cells: 4.0,
             max_count: 5,
+            min_above_floor_db: 8.0,
         }
     }
 }
@@ -206,6 +217,7 @@ mod test {
             range_db,
             min_dist_cells,
             max_count,
+            min_above_floor_db: 8.0,
         };
         let cols_rows = |config: PeakConfig| -> Vec<(i64, i64)> {
             find_peaks(&power, SIZE, &config)

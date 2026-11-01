@@ -20,6 +20,8 @@ pub const OK: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
 pub const ERROR: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
 /// Estimated source positions, contrasts with the amber overlay
 pub const PEAK: Color32 = Color32::from_rgb(0x2f, 0x81, 0xf7);
+/// Source classified as speech
+pub const SPEECH: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
 
 /// Rounding of buttons, combo boxes and popups
 const RADIUS: u8 = 6;

@@ -42,10 +42,15 @@ f_hi_hz = 4100.0
 grid_width = 64
 # Focus distance in meters
 grid_z = 2.0
+# Leave impulsive sounds (snapping, clapping, a hammer) out of the map entirely (toggle in the
+# settings menu). Off, they are shown like any other source but can never be speech: a hand
+# snapping next to a talker is inside the beam toward the talker, both beams carry the same audio,
+# and only a second map without the snaps tells them apart
+skip_transients = false
 
 [beamformer]
 # "das", "functional" or "clean_sc" (selectable in the GUI)
-method = "functional"
+method = "clean_sc"
 # Exponent of functional beamforming: larger is sharper, more sensitive to model errors
 nu = 20.0
 # Functional: subtract the median eigenvalue (noise estimate) per bin (toggle in the GUI)
@@ -62,17 +67,73 @@ clean_max_iter = 10
 clean_stop_db = 20.0
 # CLEAN-SC: width (standard deviation) of the Gaussian clean beam in grid cells; 0: single points
 clean_beam_cells = 1.5
+# CLEAN-SC: give every frequency bin with a source the same weight in the map (toggle in the
+# settings menu). Otherwise the loudest bins decide, and those are the low ones, where the array
+# cannot separate a source from its reflection off a wall or the ceiling
+clean_equal_bins = true
 
 [display]
 # Overlay range in dB below the map maximum (adjustable in the GUI)
 db_range = 3.0
 
 [peaks]
-# Estimated source positions (blue dots): local maxima of the map (toggle in the GUI)
+# Local maxima of each map, followed as tracks (see [tracking])
+# Show the tracks as dots (toggle "Tracks" in the GUI)
 enabled = true
-# Only maxima at most this many dB below the map maximum
-range_db = 6.0
+# Only maxima at most this many dB below the map maximum (a talker next to snapping is about
+# 10 dB below it; whether a peak is a source at all is decided against the noise floor)
+range_db = 12.0
 # Minimum distance between two peaks in grid cells; the weaker one is dropped
 min_dist_cells = 4.0
 # At most this many peaks, strongest first
 max_count = 5
+# A peak is a source only if this many dB more power arrives coherently from its direction than
+# from any direction in silence (the noise floor, learned from the quietest map of the last
+# minute: a pause between words is enough; a steady background source such as a fan is part of
+# it). Slider next to "Tracks" in the GUI
+min_above_floor_db = 8.0
+
+[tracking]
+# A peak continues a track if it is at most this far away, in grid cells
+max_dist_cells = 6.0
+# Maps with a matching peak (not in a row) until a track is shown (and recorded in the CLI modes)
+min_hits = 3
+# Maps in a row without a matching peak until a track is dropped
+max_missed = 5
+# Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly (less
+# puts the dot between two spots when the map's maximum jumps, e.g. to a reflection)
+smoothing = 1.0
+
+[speech]
+# Classify the audio of each track (voice-activity-detection model); speech tracks are green
+enabled = true
+# Model exported by voice-activity-detection, relative to the working directory
+model = "model/speech_detector.json"
+# Smoothed probability at which a track becomes speech (adjustable in the GUI)
+on_threshold = 0.95
+# Speech is held this long after the last frame at on_threshold or above, in ms (pauses between
+# words stay speech; other sounds after the speech do not keep it)
+hold_ms = 500.0
+# Time constant of the probability smoothing, in ms (0: no smoothing)
+smoothing_ms = 50.0
+# The smoothed probability must stay at on_threshold this long before a track turns green, in ms
+# (snapping and clapping are shorter than a syllable)
+min_onset_ms = 80.0
+# A speech track whose audio correlates at least this much (within 20 ms) with a speech track that
+# has echo_margin_db more speech energy repeats its speech (reflection, ghost, leakage into another
+# sound such as snapping) and stays blue ("echo of #N"); 1 turns the check off
+echo_correlation = 0.2
+echo_margin_db = 6.0
+# Speech ends at once when the track moves farther than this (grid cells) from where it was last
+# clearly speech, so another source nearby that takes over the track does not inherit it
+max_shift_cells = 3.0
+# Gain on the track audio before the classifier, in dB (the classifier expects microphone levels,
+# speech around -25 dBFS; the UMA-16 gives about -60 dBFS)
+gain_db = 36.0
+# Classifier frames quieter than this (after gain_db) count as non-speech, in dBFS
+min_level_db = -55.0
+# A track is speech only while its share (dB) of the power received above 2 kHz that the other
+# tracks do not explain is at least this: below 2 kHz every beam carries every talker, so a
+# talker elsewhere (also outside the image) would turn other tracks green; a loud track next to
+# the talker (snapping) does not hide the talker's share
+min_source_db = -6.0

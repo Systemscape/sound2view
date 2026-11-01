@@ -1,7 +1,9 @@
 /target
 map_*.png
+track_*.wav
 *.pdf
 *.png
 
 .DS_Store
 *.swp
+!assets/*.png

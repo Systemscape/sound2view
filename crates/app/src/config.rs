@@ -8,7 +8,10 @@ use sound2view_core::{
     geometry::camera::{Camera, Intrinsics, Mount},
     peaks::PeakConfig,
     pipeline::PipelineConfig,
+    tracking::TrackerConfig,
 };
+
+use crate::speech::SpeechConfig;
 
 /// Config file, looked up in the working directory
 pub const CONFIG_PATH: &str = "sound2view.toml";
@@ -22,6 +25,8 @@ pub struct Config {
     pub beamformer: BeamformerConfig,
     pub display: DisplayConfig,
     pub peaks: PeakConfig,
+    pub tracking: TrackerConfig,
+    pub speech: SpeechConfig,
 }
 
 impl Config {
@@ -197,12 +202,15 @@ pub struct BeamformerConfig {
     pub clean_stop_db: f64,
     /// CLEAN-SC: standard deviation of the Gaussian clean beam in grid cells (0: single points)
     pub clean_beam_cells: f64,
+    /// CLEAN-SC: divide each bin's clean map by its maximum before summing (every bin with a
+    /// source has the same say; otherwise the loudest, lowest bins decide)
+    pub clean_equal_bins: bool,
 }
 
 impl Default for BeamformerConfig {
     fn default() -> Self {
         Self {
-            method: Method::Functional,
+            method: Method::CleanSc,
             nu: 20.0,
             functional_noise_removal: true,
             functional_equal_bins: true,
@@ -210,6 +218,7 @@ impl Default for BeamformerConfig {
             clean_max_iter: 10,
             clean_stop_db: 20.0,
             clean_beam_cells: 1.5,
+            clean_equal_bins: true,
         }
     }
 }
@@ -265,6 +274,8 @@ impl Config {
                 "peaks: range_db must be > 0, min_dist_cells >= 0, max_count >= 1".to_string(),
             );
         }
+        self.tracking.validate()?;
+        self.speech.validate()?;
         if self.display.db_range <= 0.0 {
             return Err("display.db_range must be > 0".to_string());
         }
