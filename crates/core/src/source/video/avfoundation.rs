@@ -24,8 +24,8 @@ use objc2_av_foundation::{
     AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceDiscoverySession,
     AVCaptureDeviceFormat, AVCaptureDeviceInput, AVCaptureDevicePosition,
     AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal, AVCaptureOutput,
-    AVCaptureSession, AVCaptureSessionPresetInputPriority, AVCaptureVideoDataOutput,
-    AVCaptureVideoDataOutputSampleBufferDelegate, AVFrameRateRange, AVMediaTypeVideo,
+    AVCaptureSession, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVFrameRateRange, AVMediaTypeVideo,
 };
 use objc2_core_foundation::CFString;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetDimensions};
@@ -209,9 +209,9 @@ impl CameraSource {
                 session.addInput(&input);
                 session.addOutput(&output);
 
-                // Input priority: the session keeps the device format set below instead of
-                // choosing its own (setting the format switches to it as well, explicit is safer)
-                session.setSessionPreset(AVCaptureSessionPresetInputPriority);
+                // Setting the active format switches the session to the input-priority preset,
+                // so the session keeps it instead of choosing its own. Never set that preset
+                // explicitly: `setSessionPreset` throws for it (uncaught, aborts the process).
                 if let Err(e) = device.lockForConfiguration() {
                     session.commitConfiguration();
                     return Err(ns_error(e));
