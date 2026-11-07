@@ -172,7 +172,7 @@ mod test {
 
         for (power, r) in power.iter().zip(scan_grid.points()) {
             let a_i_norm_squared: f64 = mic_array
-                .get_distance_from(&r)
+                .get_distance_from(r)
                 .iter()
                 .map(|r| r.powi(-2))
                 .sum();
