@@ -5,24 +5,29 @@ use image::{
     imageops::{self, FilterType},
 };
 
-use crate::{Point3, peaks::Peak, pipeline::MapLayout};
+use crate::{Point3, pipeline::MapLayout, tracking::Track};
 
 /// Marker half length in camera pixels
 const MARKER_HALF_LEN: i64 = 10;
-/// Radius of the dot per estimated source in camera pixels
+/// Radius of the dot per confirmed track in camera pixels
 const PEAK_RADIUS: i64 = 8;
+/// Dot colors: track, and track classified as speech
+const TRACK_RGB: Rgb<u8> = Rgb([40, 120, 255]);
+const SPEECH_RGB: Rgb<u8> = Rgb([63, 185, 80]);
 
-/// Power map as image at camera resolution, with a red cross per true source and a blue dot per
-/// peak.
+/// Power map as image at camera resolution, with a red cross per true source and a dot per
+/// confirmed track: blue, or green if its id is in `speech`.
 ///
 /// - `power`: row-major like the scan grid, `grid_width * grid_height` values
 /// - `src_pos`: true source positions, array frame
-/// - `peaks`: estimated sources in grid cells, see [`crate::peaks::find_peaks`]
+/// - `tracks`: estimated sources in grid cells, see [`crate::tracking::Tracker`]
+/// - `speech`: ids of the tracks classified as speech
 pub fn map_image(
     power: &[f64],
     layout: &MapLayout,
     src_pos: &[Point3],
-    peaks: &[Peak],
+    tracks: &[Track],
+    speech: &[u64],
 ) -> RgbImage {
     // One grid pixel per map value; x = col, y = row, same as `power[row * w + col]`
     let w = layout.grid_width;
@@ -43,16 +48,21 @@ pub fn map_image(
     // Grid cell centers to camera pixel centers, as `Intrinsics::scaled`
     let s_x = intrinsics.width as f64 / layout.grid_width as f64;
     let s_y = intrinsics.height as f64 / layout.grid_height as f64;
-    for peak in peaks {
-        let u = ((peak.col + 0.5) * s_x - 0.5).round() as i64;
-        let v = ((peak.row + 0.5) * s_y - 0.5).round() as i64;
+    for track in tracks.iter().filter(|track| track.confirmed) {
+        let u = ((track.col + 0.5) * s_x - 0.5).round() as i64;
+        let v = ((track.row + 0.5) * s_y - 0.5).round() as i64;
+        let color = if speech.contains(&track.id) {
+            SPEECH_RGB
+        } else {
+            TRACK_RGB
+        };
         for dy in -PEAK_RADIUS..=PEAK_RADIUS {
             for dx in -PEAK_RADIUS..=PEAK_RADIUS {
                 let (x, y) = (u + dx, v + dy);
                 let inside =
                     (0..big.width() as i64).contains(&x) && (0..big.height() as i64).contains(&y);
                 if dx * dx + dy * dy <= PEAK_RADIUS * PEAK_RADIUS && inside {
-                    big.put_pixel(x as u32, y as u32, Rgb([40, 120, 255]));
+                    big.put_pixel(x as u32, y as u32, color);
                 }
             }
         }

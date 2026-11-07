@@ -223,9 +223,9 @@ mod tests {
             cov.accumulate(&y);
         }
 
-        for k in 0..N_BINS {
-            let target = y[k] * y[k].adjoint();
-            let error = (cov.estimate()[k] - target).norm() / target.norm();
+        for (k, (estimate, y_k)) in cov.estimate().iter().zip(&y).enumerate() {
+            let target = y_k * y_k.adjoint();
+            let error = (estimate - target).norm() / target.norm();
             assert!(error < 1e-8, "bin {k}: relative error {error}");
         }
     }

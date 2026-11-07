@@ -1,7 +1,9 @@
 use std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     error::Error,
-    fs,
+    fs::{self, File},
+    io::BufWriter,
     ops::ControlFlow,
     thread,
     time::{Duration, Instant},
@@ -10,11 +12,12 @@ use std::{
 use image::RgbaImage;
 use sound2view_core::{
     BoxError, FrameSource, ImageSource, Point3,
+    dsp::beam_signal::TRACK_SAMPLE_RATE,
     dsp::beamformer::{
         Normalization, clean_sc::CleanSc, delay_and_sum::Das, functional::Functional,
     },
     geometry::mic_array::MicArray,
-    peaks::{PeakConfig, find_peaks},
+    peaks::PeakConfig,
     pipeline::{MapLayout, Pipeline, PipelineError, run},
     render,
     source::{
@@ -22,24 +25,35 @@ use sound2view_core::{
         simulator::{Simulator, scene::Scene},
         video::{self, CameraSource},
     },
+    tracking::Track,
 };
 
-use crate::config::{CONFIG_PATH, Config, Method};
+use crate::{
+    config::{CONFIG_PATH, Config, Method},
+    gui_state::GuiState,
+    speech::{SpeechConfig, SpeechDetector},
+};
 
 mod config;
 mod gui;
+mod gui_state;
+mod speech;
 mod theme;
 
-/// Number of maps written in mic mode
+/// Number of maps written in mic mode, unless given as argument
 const MIC_MAPS: usize = 20;
 /// Frames timed in camshot mode
 const CAMSHOT_FRAMES: usize = 60;
+/// Cores the beamformers (rayon) leave free in the GUI: for the camera thread (frame copy) and
+/// drawing. With all cores busy computing maps the camera image stuttered on a Mac mini.
+const GUI_FREE_CORES: usize = 2;
 /// CLI modes wait this long for the user to grant camera access (macOS asks on the first run)
 const CAMERA_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Usage (settings from `sound2view.toml`, see `config.rs`):
 /// - `sound2view [scene.toml]`: simulate a scene, defaults to `config.toml`
-/// - `sound2view mic`: capture from the UMA-16
+/// - `sound2view mic [maps]`: capture from the UMA-16, `MIC_MAPS` maps unless given (about 9 per
+///   second)
 /// - `sound2view probe`: list audio input devices
 /// - `sound2view camprobe`: list cameras and their formats
 /// - `sound2view camshot`: time camera frames and save one as `camshot.png`
@@ -64,7 +78,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             video::initialize();
             run_gui(Config::load(CONFIG_PATH)?)
         }
-        "mic" => run_mic(&Config::load(CONFIG_PATH)?),
+        "mic" => {
+            let maps = match env::args().nth(2) {
+                Some(n) => n
+                    .parse()
+                    .map_err(|_| format!("mic: not a map count: {n}"))?,
+                None => MIC_MAPS,
+            };
+            run_mic(&Config::load(CONFIG_PATH)?, maps)
+        }
         path => run_sim(path, &Config::load(CONFIG_PATH)?),
     }
 }
@@ -113,12 +135,13 @@ fn run_sim(path: &str, config: &Config) -> Result<(), Box<dyn Error>> {
     let sample_rate = scene.sample_rate;
     let mut sim = Simulator::new(scene, MicArray::uma16())?;
 
-    let on_map = save_maps(src_pos, None, config.peaks.clone());
+    let speech = load_speech(&config.speech);
+    let on_map = save_maps(src_pos, None, config.peaks.clone(), speech);
     run_configured(&mut sim, sample_rate, config, on_map)?;
     Ok(())
 }
 
-fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
+fn run_mic(config: &Config, maps: usize) -> Result<(), Box<dyn Error>> {
     let audio = &config.audio;
     println!(
         "Capturing from {} at {} Hz",
@@ -131,7 +154,12 @@ fn run_mic(config: &Config) -> Result<(), Box<dyn Error>> {
         &mut mic,
         sample_rate,
         config,
-        save_maps(Vec::new(), Some(MIC_MAPS), config.peaks.clone()),
+        save_maps(
+            Vec::new(),
+            Some(maps),
+            config.peaks.clone(),
+            load_speech(&config.speech),
+        ),
     )?;
 
     println!("dropped {} chunks", mic.dropped());
@@ -145,63 +173,107 @@ fn run_configured<S: FrameSource<16>>(
     source: &mut S,
     sample_rate: f64,
     config: &Config,
-    on_map: impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError>,
+    on_map: impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError>,
 ) -> Result<(), PipelineError> {
     let camera = config.camera.camera();
     let pipeline = &config.pipeline;
     let b = &config.beamformer;
+    let (peaks, tracking) = (&config.peaks, &config.tracking);
 
     match b.method {
         Method::Das => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
-                Das::new(steering, true, Normalization::TrueLocation)
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    Das::new(steering, true, Normalization::TrueLocation)
+                })?;
             run(source, pipeline, on_map)
         }
         Method::Functional => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
-                Functional::new(
-                    steering,
-                    b.nu,
-                    b.functional_noise_removal,
-                    b.functional_equal_bins,
-                )
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    Functional::new(
+                        steering,
+                        b.nu,
+                        b.functional_noise_removal,
+                        b.functional_equal_bins,
+                    )
+                })?;
             run(source, pipeline, on_map)
         }
         Method::CleanSc => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, camera, |steering| {
-                CleanSc::new(
-                    steering,
-                    b.clean_gain,
-                    b.clean_max_iter,
-                    b.clean_stop_db,
-                    b.clean_beam_cells,
-                    true,
-                )
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    CleanSc::new(
+                        steering,
+                        b.clean_gain,
+                        b.clean_max_iter,
+                        b.clean_stop_db,
+                        b.clean_beam_cells,
+                        true,
+                        b.clean_equal_bins,
+                    )
+                })?;
             run(source, pipeline, on_map)
         }
     }
 }
 
+/// Speech detector from `config`; `None` if disabled or the model does not load (with a note)
+fn load_speech(config: &SpeechConfig) -> Option<SpeechDetector> {
+    if !config.enabled {
+        return None;
+    }
+    SpeechDetector::load(config)
+        .inspect_err(|e| eprintln!("No speech detection: {e}"))
+        .ok()
+}
+
 /// Map handler for `run`: writes each map as `map_NNN.png` with a red cross per `src_pos` and a
-/// blue dot per peak (if `peaks.enabled`).
+/// dot per shown track (confirmed and `peaks.min_above_floor_db` above the noise floor, if
+/// `peaks.enabled`; green if classified as speech by `speech`), and the audio of each shown
+/// track to `track_NNN.wav` (see [`TrackRecorder`]). Prints when a shown track starts or stops
+/// being speech.
 ///
 /// Stops after `max_maps` maps; `None` runs until the stream ends.
 fn save_maps(
     src_pos: Vec<Point3>,
     max_maps: Option<usize>,
     peaks: PeakConfig,
-) -> impl FnMut(&[f64], &MapLayout) -> Result<ControlFlow<()>, BoxError> {
+    mut speech: Option<SpeechDetector>,
+) -> impl FnMut(&[f64], &MapLayout, &[Track]) -> Result<ControlFlow<()>, BoxError> {
     let mut i = 0;
-    move |power, layout| {
-        let found = if peaks.enabled {
-            find_peaks(power, [layout.grid_width, layout.grid_height], &peaks)
-        } else {
-            Vec::new()
-        };
-        render::map_image(power, layout, &src_pos, &found).save(format!("map_{i:03}.png"))?;
+    let mut recorder = TrackRecorder::default();
+    let mut talking: HashSet<u64> = HashSet::new();
+    move |power, layout, tracks| {
+        let shown: Vec<Track> = tracks
+            .iter()
+            .filter(|track| track.shown(&peaks))
+            .cloned()
+            .collect();
+        let mut speech_ids = Vec::new();
+        if let Some(detector) = &mut speech {
+            detector.update(tracks)?;
+            for track in &shown {
+                let is_speech = detector.status(track.id).is_some_and(|s| s.speech);
+                if is_speech {
+                    speech_ids.push(track.id);
+                }
+                if is_speech != talking.contains(&track.id) {
+                    let change = if is_speech { "speech" } else { "no speech" };
+                    println!("map {i}: track #{} {change}", track.id);
+                    if is_speech {
+                        talking.insert(track.id);
+                    } else {
+                        talking.remove(&track.id);
+                    }
+                }
+            }
+        }
+
+        let drawn = if peaks.enabled { &shown[..] } else { &[] };
+        render::map_image(power, layout, &src_pos, drawn, &speech_ids)
+            .save(format!("map_{i:03}.png"))?;
+        recorder.record(&shown)?;
         i += 1;
         if max_maps.is_some_and(|max| i >= max) {
             Ok(ControlFlow::Break(()))
@@ -211,14 +283,70 @@ fn save_maps(
     }
 }
 
+/// Writes the audio of each confirmed track to `track_NNN.wav` (NNN = track id), mono 32-bit
+/// float at `TRACK_SAMPLE_RATE`, to check by ear whether a beam isolates its source. Audio from
+/// before the confirmation is not written. The files are finalized when the recorder is dropped.
+#[derive(Default)]
+struct TrackRecorder {
+    writers: HashMap<u64, hound::WavWriter<BufWriter<File>>>,
+}
+
+impl TrackRecorder {
+    fn record(&mut self, tracks: &[Track]) -> Result<(), BoxError> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: TRACK_SAMPLE_RATE as u32,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        for track in tracks.iter().filter(|track| track.confirmed) {
+            let writer = match self.writers.entry(track.id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let path = format!("track_{:03}.wav", track.id);
+                    entry.insert(hound::WavWriter::create(path, spec)?)
+                }
+            };
+            for &sample in &track.samples {
+                writer.write_sample(sample)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Window and dock icon, rendered from `assets/logo.svg`
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/logo-256.png");
+
 fn run_gui(config: Config) -> Result<(), Box<dyn Error>> {
+    leave_cores_for_gui();
+    // Settings menu values of the last run on top of sound2view.toml; the GUI saves only what
+    // differs from `base`
+    let base = GuiState::of_config(&config);
+    let saved = GuiState::load();
+    let config = saved.apply(&config);
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG)?;
     eframe::run_native(
         "sound2view",
         eframe::NativeOptions {
-            viewport: eframe::egui::ViewportBuilder::default().with_maximized(true),
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_maximized(true)
+                .with_icon(icon),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(gui::App::new(cc, config)))),
+        Box::new(move |cc| Ok(Box::new(gui::App::new(cc, config, base, saved.camera)))),
     )?;
     Ok(())
+}
+
+/// Limit rayon's global pool to all cores but `GUI_FREE_CORES` (at least one thread)
+fn leave_cores_for_gui() {
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cores.saturating_sub(GUI_FREE_CORES).max(1);
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        eprintln!("rayon thread pool: {e}");
+    }
 }

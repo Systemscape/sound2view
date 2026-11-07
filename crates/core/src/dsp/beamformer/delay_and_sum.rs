@@ -120,6 +120,7 @@ mod test {
     use nalgebra::SMatrix;
 
     use crate::{
+        Complex64,
         dsp::{
             beamformer::{
                 Beamformer as _, Steering,
@@ -171,7 +172,7 @@ mod test {
 
         for (power, r) in power.iter().zip(scan_grid.points()) {
             let a_i_norm_squared: f64 = mic_array
-                .get_distance_from(&r)
+                .get_distance_from(r)
                 .iter()
                 .map(|r| r.powi(-2))
                 .sum();
@@ -274,33 +275,129 @@ mod test {
     /// Expect P(p_0) = 1: checks the new normalization and the diagonal term together.
     #[test]
     fn diag_removal_hand_built_r_at_source() {
-        // 1. Same setup as `hand_built_r_peak_at_source`, but `Das::new(..., true)`
-        // 2. power_map over BIN..=BIN
-        // 3. assert P(p_0) = 1
-        todo!()
+        let (row, col) = (10, 20);
+        let scan_grid = test_scan_grid();
+        let mic_array = MicArray::uma16();
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let das_beamformer = Das::new(steering, true, Normalization::TrueLevel);
+
+        let p_0 = scan_grid.points()[scan_grid.index(row, col)];
+        let a_0 = mic_array.steering(&p_0, F_SINE);
+        let mut cov = vec![SMatrix::zeros(); FFT_LEN / 2 + 1];
+        cov[BIN] = a_0 * a_0.adjoint();
+
+        let mut power = vec![0.0; scan_grid.points().len()];
+        das_beamformer.power_map(&cov, BIN..=BIN, &mut power);
+
+        let p = power[scan_grid.index(row, col)];
+        assert!((p - 1.0).abs() < 1e-12, "P(p_0) should be 1, got {p}");
     }
 
     /// R = sigma^2 I in one bin, nothing else.
     /// Expect P = 0 everywhere with diagonal removal, sigma^2 / (a^H a) without.
     #[test]
     fn diag_removal_noise_only_is_zero() {
-        // 1. cov[BIN] = sigma^2 * I, zeros elsewhere
-        // 2. power_map with `true`: assert |P| < tol everywhere (tol relative to sigma^2)
-        // 3. power_map with `false`: assert P = sigma^2 / sum(1/r_m^2) per point
-        todo!()
+        let sigma_sq = 3.0;
+        let scan_grid = test_scan_grid();
+        let mic_array = MicArray::uma16();
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+        let mut cov = vec![SMatrix::zeros(); FFT_LEN / 2 + 1];
+        cov[BIN] = SMatrix::identity() * Complex64::new(sigma_sq, 0.0);
+
+        let mut power = vec![0.0; scan_grid.points().len()];
+        Das::new(steering.clone(), true, Normalization::TrueLevel).power_map(
+            &cov,
+            BIN..=BIN,
+            &mut power,
+        );
+        for (p, r) in power.iter().zip(scan_grid.points()) {
+            assert!(p.abs() < 1e-12 * sigma_sq, "P at {r} should be 0, got {p}");
+        }
+
+        Das::new(steering, false, Normalization::TrueLevel).power_map(&cov, BIN..=BIN, &mut power);
+        for (p, r) in power.iter().zip(scan_grid.points()) {
+            let sum_g: f64 = mic_array
+                .get_distance_from(r)
+                .iter()
+                .map(|r_m| r_m.powi(-2))
+                .sum();
+            let expected = sigma_sq / sum_g;
+            assert!(
+                (p - expected).abs() < 1e-12 * expected,
+                "P at {r}: expected {expected}, got {p}"
+            );
+        }
     }
 
     /// Oracle R vs stream R_est with strong mic noise, diagonal removal on.
     /// Expect the peak at the source for both, and P_est close to P_ref = S.
     #[test]
     fn diag_removal_stream_r_peak_at_source() {
-        // 1. Source on the center grid point, 110 dB mic noise
-        // 2. cov_ref = reference_covariance(...), (cov_est, l) = stream_covariance(...)
-        // 3. power_map for both with `true`
-        // 4. assert P_ref(source) = sine_bin_power (sigma^2 I is gone)
-        // 5. assert argmax of P_est == source index
-        // 6. assert P_est(source) close to P_ref(source)
-        // 7. optional: compare with `false`, |P_est - P_ref| should be smaller with removal
-        todo!()
+        const DURATION_S: f64 = 1.0;
+        let scan_grid = test_scan_grid();
+        let mut scene = test_scene(110.0, DURATION_S);
+        let idx_source = scan_grid.index(scan_grid.height() / 2, scan_grid.width() / 2);
+        scene.sources[0].pos = scan_grid.points()[idx_source];
+        let mic_array = MicArray::uma16();
+        let steering = Steering::new(&scan_grid, &mic_array, SAMPLE_RATE, FFT_LEN);
+
+        let cov_ref = reference_covariance(&scene, &mic_array, &Stft::new(FFT_LEN));
+        let (cov_est, l) = stream_covariance(&scene, &mic_array);
+        assert!(l > 0, "no STFT frames");
+
+        let argmax = |power: &[f64]| {
+            power
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        let mut power_ref = vec![0.0; scan_grid.points().len()];
+        let mut power_est = vec![0.0; scan_grid.points().len()];
+        let with_removal = Das::new(steering.clone(), true, Normalization::TrueLevel);
+        with_removal.power_map(&cov_ref, BIN..=BIN, &mut power_ref);
+        with_removal.power_map(&cov_est, BIN..=BIN, &mut power_est);
+
+        // sigma^2 I is gone from the oracle map: exactly the sine power at the source
+        let expected = sine_bin_power(scene.sources[0].signal.components()[0].amplitude, FFT_LEN);
+        let p_ref = power_ref[idx_source];
+        assert!(
+            (p_ref - expected).abs() < 1e-9 * expected,
+            "P_ref at source: expected {expected}, got {p_ref}"
+        );
+        assert_eq!(
+            argmax(&power_ref),
+            idx_source,
+            "oracle maximum off the source"
+        );
+        // The main lobe spans dozens of cells of this fine grid and its top is flat to well
+        // below a percent between neighbors, so the estimation noise moves the maximum by a
+        // cell
+        let idx_est = argmax(&power_est);
+        let width = scan_grid.width();
+        let (col_est, row_est) = (idx_est % width, idx_est / width);
+        let (col, row) = (idx_source % width, idx_source / width);
+        assert!(
+            col_est.abs_diff(col) <= 1 && row_est.abs_diff(row) <= 1,
+            "stream maximum at ({col_est}, {row_est}), source at ({col}, {row})"
+        );
+        // Only the estimation noise remains, about sqrt(2 sigma^2 / (|a|^2 S L)) relative
+        let p_est = power_est[idx_source];
+        assert!(
+            (p_est - p_ref).abs() < 0.05 * p_ref,
+            "P_est at source: expected {p_ref}, got {p_est}"
+        );
+
+        // Without removal the noise adds sigma^2 / sum(g): a larger error than with removal
+        let without = Das::new(steering, false, Normalization::TrueLevel);
+        let mut power_plain = vec![0.0; scan_grid.points().len()];
+        without.power_map(&cov_est, BIN..=BIN, &mut power_plain);
+        let plain_error = (power_plain[idx_source] - expected).abs();
+        assert!(
+            (p_est - expected).abs() < plain_error,
+            "removal error {} not below {plain_error}",
+            (p_est - expected).abs()
+        );
     }
 }

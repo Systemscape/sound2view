@@ -4,6 +4,7 @@ pub mod peaks;
 pub mod pipeline;
 pub mod render;
 pub mod source;
+pub mod tracking;
 
 #[cfg(test)]
 pub(crate) mod test_util;

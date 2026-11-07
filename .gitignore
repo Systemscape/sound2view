@@ -1,7 +1,12 @@
 /target
 map_*.png
+track_*.wav
 *.pdf
 *.png
 
 .DS_Store
 *.swp
+!assets/*.png
+
+# GUI settings of the last run
+sound2view-gui.toml
