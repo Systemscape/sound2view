@@ -51,7 +51,8 @@ pub fn reference_covariance<const M: usize>(
             let bin_lower_range = bin.saturating_sub(BINS_AROUND);
             let bin_upper_range = cmp::min(fft_len / 2, bin + BINS_AROUND);
 
-            for k in bin_lower_range..=bin_upper_range {
+            let bins = bin_lower_range..=bin_upper_range;
+            for (k, r_k) in bins.clone().zip(&mut r_ref[bins]) {
                 // distance to bin k, in cycles per sample
                 let offset = component.freq_hz / f_s - k as f64 / fft_len as f64;
 
@@ -62,7 +63,7 @@ pub fn reference_covariance<const M: usize>(
                     .sum();
 
                 let s_q = (component.amplitude / 2.0).powi(2) * w_k.norm_sqr();
-                r_ref[k] += a_ah.scale(s_q);
+                *r_k += a_ah.scale(s_q);
             }
         }
     }

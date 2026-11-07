@@ -110,8 +110,8 @@ impl<const M: usize> StftStream<M> {
         let fft_len = self.stft.fft_len();
 
         for frame in chunk.as_chunks::<M>().0 {
-            for m in 0..M {
-                self.buf[m][self.fill] = frame[m];
+            for (buf, &x_m) in self.buf.iter_mut().zip(frame) {
+                buf[self.fill] = x_m;
             }
             self.fill += 1;
 

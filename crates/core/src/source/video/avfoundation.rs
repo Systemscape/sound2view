@@ -315,8 +315,10 @@ unsafe fn to_rgba(sample_buffer: &CMSampleBuffer) -> Option<VideoFrame> {
             // SAFETY: the locked buffer holds `height` rows of `stride` bytes, each starting
             // with `width` BGRA pixels
             let line = unsafe { slice::from_raw_parts(base.add(row * stride), width * 4) };
-            for (rgba, bgra) in out.chunks_exact_mut(4).zip(line.chunks_exact(4)) {
-                rgba.copy_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
+            let (rgba, _) = out.as_chunks_mut::<4>();
+            let (bgra, _) = line.as_chunks::<4>();
+            for (rgba, bgra) in rgba.iter_mut().zip(bgra) {
+                *rgba = [bgra[2], bgra[1], bgra[0], 255];
             }
         }
     }

@@ -174,7 +174,7 @@ mod test {
         let tau_mk_approx = p
             .map(|p_m| p_m.coords.dot(&u_k))
             .map(distance_to_delay)
-            .map(|x| -1.0 * x + distance_to_delay(DISTANCE));
+            .map(|x| -x + distance_to_delay(DISTANCE));
 
         println!("tau_mk: {tau_mk:#?}, tau_mk_approx: {tau_mk_approx:#?}");
 
