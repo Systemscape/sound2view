@@ -42,6 +42,11 @@ f_hi_hz = 4100.0
 grid_width = 64
 # Focus distance in meters
 grid_z = 2.0
+# The scan grid reaches this many degrees beyond the field of view on every side (at most 55
+# degrees off axis); only the visible part is shown. A source outside the image gets its own cell
+# there instead of lighting up the image border, and CLEAN-SC takes it out of the visible part.
+# Map time grows with the cells (about 3x at 15); 0 turns it off.
+grid_margin_deg = 15.0
 # Leave impulsive sounds (snapping, clapping, a hammer) out of the map entirely (toggle in the
 # settings menu). Off, they are shown like any other source but can never be speech: a hand
 # snapping next to a talker is inside the beam toward the talker, both beams carry the same audio,

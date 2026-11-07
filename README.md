@@ -46,7 +46,12 @@ cargo run --release -- mic        # live maps from the UMA-16
 cargo run --release -- scene.toml # simulated scene (default: config.toml)
 ```
 
-Settings (audio device, camera name and format, field of view, band, beamformer, overlay range)
-are read from `sound2view.toml` in the working directory; every entry is optional and defaults
-to the values in the shipped file. Beamformer, nu, band and overlay range can also be changed
-live in the GUI (not written back to the file).
+Settings (audio device, camera name and format, field of view, band, beamformer, overlay range,
+scan grid) are read from `sound2view.toml` in the working directory; every entry is optional and
+defaults to the values in the shipped file, which documents each one. Beamformer, band, overlay
+range and the source thresholds can also be changed live in the settings menu of the GUI; those
+changes are saved to `sound2view-gui.toml` next to it.
+
+The scan grid extends `pipeline.grid_margin_deg` (15) degrees beyond the camera image on every
+side, so a sound source just outside the image gets its own spot there instead of lighting up the
+image border; with CLEAN-SC the visible part stays dark. Set it to 0 to save map time.

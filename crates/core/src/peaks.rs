@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::geometry::scan_grid::Viewport;
+
 /// Peak search parameters, e.g. from a config file
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -72,18 +74,44 @@ pub struct Peak {
 /// Positions are refined with a parabola through the log power of the cell and its two
 /// neighbors, separately per axis (exact for a Gaussian peak). Empty if the maximum is <= 0.
 pub fn find_peaks(power: &[f64], [width, height]: [usize; 2], config: &PeakConfig) -> Vec<Peak> {
+    find_peaks_in(
+        power,
+        [width, height],
+        Viewport::full(width, height),
+        config,
+    )
+}
+
+/// Like [`find_peaks`], but only the peaks inside `viewport` (the part of the scan grid the
+/// camera sees), with positions and `center_weight_db` relative to it and `range_db` relative
+/// to its maximum. Maxima outside still take part in the `min_dist_cells` check, so a source
+/// just outside the image suppresses the local maxima its main lobe leaves near the border,
+/// but they do not count toward `max_count`. `edge_margin_cells` applies to the border of the
+/// whole map.
+pub fn find_peaks_in(
+    power: &[f64],
+    [width, height]: [usize; 2],
+    viewport: Viewport,
+    config: &PeakConfig,
+) -> Vec<Peak> {
     assert_eq!(
         power.len(),
         width * height,
         "power must have width * height values"
     );
+    let at = |row: usize, col: usize| power[row * width + col];
 
-    let p_max = power.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let p_max = (viewport.row..viewport.row + viewport.height)
+        .flat_map(|row| (viewport.col..viewport.col + viewport.width).map(move |col| (row, col)))
+        .map(|(row, col)| at(row, col))
+        .fold(f64::NEG_INFINITY, f64::max);
     if p_max <= 0.0 || config.max_count == 0 {
         return Vec::new();
     }
     let threshold = p_max * 10f64.powf(-config.range_db / 10.0);
-    let at = |row: usize, col: usize| power[row * width + col];
+    // Relative to the viewport
+    let (dc, dr) = (viewport.col as f64, viewport.row as f64);
+    let size = [viewport.width, viewport.height];
 
     let mut candidates: Vec<(usize, usize)> = (0..height)
         .flat_map(|row| (0..width).map(move |col| (row, col)))
@@ -94,13 +122,15 @@ pub fn find_peaks(power: &[f64], [width, height]: [usize; 2], config: &PeakConfi
         .collect();
     // Strongest first, central ones preferred (see `center_weight_db`)
     let weighted = |row: usize, col: usize| {
-        let penalty = center_penalty_db(col as f64, row as f64, [width, height], config);
+        let penalty = center_penalty_db(col as f64 - dc, row as f64 - dr, size, config);
         at(row, col) * 10f64.powf(-penalty / 10.0)
     };
     candidates.sort_by(|&(r1, c1), &(r2, c2)| weighted(r2, c2).total_cmp(&weighted(r1, c1)));
     let margin = config.edge_margin_cells;
     let (max_col, max_row) = ((width - 1) as f64 - margin, (height - 1) as f64 - margin);
 
+    // Kept maxima in full grid cells, inside and outside the viewport, for the distance check
+    let mut kept: Vec<(f64, f64)> = Vec::new();
     let mut peaks: Vec<Peak> = Vec::new();
     for (row, col) in candidates {
         if peaks.len() == config.max_count {
@@ -124,18 +154,21 @@ pub fn find_peaks(power: &[f64], [width, height]: [usize; 2], config: &PeakConfi
             continue;
         }
 
-        let too_close = peaks
+        let too_close = kept
             .iter()
-            .any(|peak| (peak.row - peak_row).hypot(peak.col - peak_col) < config.min_dist_cells);
+            .any(|&(c, r)| (r - peak_row).hypot(c - peak_col) < config.min_dist_cells);
         if too_close {
             continue;
         }
+        kept.push((peak_col, peak_row));
 
-        peaks.push(Peak {
-            col: peak_col,
-            row: peak_row,
-            level_db: 10.0 * (p / p_max).log10(),
-        });
+        if viewport.contains(peak_col, peak_row) {
+            peaks.push(Peak {
+                col: peak_col - dc,
+                row: peak_row - dr,
+                level_db: 10.0 * (p / p_max).log10(),
+            });
+        }
     }
     peaks
 }
@@ -202,7 +235,7 @@ fn parabola_offset(left: f64, center: f64, right: f64) -> f64 {
 
 #[cfg(test)]
 mod test {
-    use super::{PeakConfig, center_penalty_db, find_peaks};
+    use super::{PeakConfig, Viewport, center_penalty_db, find_peaks, find_peaks_in};
 
     const SIZE: [usize; 2] = [40, 30];
 
@@ -309,6 +342,43 @@ mod test {
 
         assert_eq!(peaks.len(), 1);
         assert!((peaks[0].col - 3.0).abs() < 0.5, "col {}", peaks[0].col);
+    }
+
+    /// A viewport inside the map: a strong source outside it (its lobe reaching in) is not
+    /// returned but suppresses the maximum it leaves inside within `min_dist_cells`; a peak
+    /// inside comes out relative to the viewport, below 0 dB (the suppressed border maximum is
+    /// the visible maximum).
+    #[test]
+    fn viewport_hides_outside_peaks() {
+        let viewport = Viewport {
+            col: 8,
+            row: 6,
+            width: 24,
+            height: 18,
+        };
+        // Outside at col 5, the lobe leaves a maximum at col 8 (the viewport border, 3 cells
+        // away), a real source at (20, 15)
+        let power = gaussians(&[
+            (5.0, 15.0, 4.0, 2.0),
+            (8.0, 15.0, 1.5, 0.5),
+            (20.0, 15.0, 1.0, 1.5),
+        ]);
+        let config = PeakConfig {
+            center_weight_db: 0.0,
+            ..PeakConfig::default()
+        };
+        let peaks = find_peaks_in(&power, SIZE, viewport, &config);
+
+        assert_eq!(peaks.len(), 1, "{peaks:?}");
+        assert!((peaks[0].col - 12.0).abs() < 0.1, "col {}", peaks[0].col);
+        assert!((peaks[0].row - 9.0).abs() < 0.1, "row {}", peaks[0].row);
+        assert!(peaks[0].level_db < 0.0, "level {}", peaks[0].level_db);
+
+        // Without the outside source, the border maximum is a peak of its own
+        let power = gaussians(&[(8.0, 15.0, 1.5, 0.5), (20.0, 15.0, 1.0, 1.5)]);
+        let peaks = find_peaks_in(&power, SIZE, viewport, &config);
+        assert_eq!(peaks.len(), 2, "{peaks:?}");
+        assert!((peaks[0].col).abs() < 0.1, "col {}", peaks[0].col);
     }
 
     /// Two equally strong peaks with `max_count` 1: the central one wins.

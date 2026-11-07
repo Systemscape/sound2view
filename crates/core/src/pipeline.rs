@@ -18,8 +18,12 @@ use crate::{
         covariance::SlidingCovariance,
         stft::{Stft, StftStream},
     },
-    geometry::{camera::Camera, mic_array::MicArray, scan_grid::ScanGrid},
-    peaks::{PeakConfig, center_penalty_db, find_peaks},
+    geometry::{
+        camera::Camera,
+        mic_array::MicArray,
+        scan_grid::{MAX_OFF_AXIS_DEG, ScanGrid, Viewport},
+    },
+    peaks::{PeakConfig, center_penalty_db, find_peaks_in},
     tracking::{Track, Tracker, TrackerConfig},
 };
 
@@ -41,6 +45,13 @@ pub struct PipelineConfig {
     pub grid_width: u32,
     /// Focus distance of the scan grid in meters
     pub grid_z: f64,
+    /// The scan grid reaches this many degrees beyond the camera field of view on every side (as
+    /// far as [`MAX_OFF_AXIS_DEG`] allows), at the same cell size; only the visible part is shown.
+    /// A source outside the image then has its maximum at its own direction instead of on the
+    /// image border, where the main lobe (about 34 degrees at 3 kHz) would otherwise leak in, and
+    /// a deconvolving beamformer (CLEAN-SC) takes it out of the visible part. The map time grows
+    /// with the number of cells (about 3x at 15 degrees with the 83 degree camera).
+    pub grid_margin_deg: f64,
     /// Leave impulsive sounds (snapping, clapping, a hammer) out of the map entirely: STFT
     /// frames whose energy jumps `TRANSIENT_DB` above the recent median are not accumulated.
     /// Off, they are shown like any other source, but a second, steady map without those
@@ -58,6 +69,7 @@ impl Default for PipelineConfig {
             f_hi_hz: 4100.0,
             grid_width: 64,
             grid_z: 2.0,
+            grid_margin_deg: 15.0,
             skip_transients: false,
         }
     }
@@ -124,6 +136,9 @@ impl PipelineConfig {
         if self.grid_width == 0 || self.grid_z <= 0.0 {
             return invalid("grid_width must be at least 1 and grid_z > 0");
         }
+        if !(0.0..90.0).contains(&self.grid_margin_deg) {
+            return invalid("grid_margin_deg must be at least 0 and below 90");
+        }
         Ok(())
     }
 }
@@ -154,8 +169,11 @@ pub struct Pipeline<const M: usize, B: Beamformer<M>> {
     floor_window: usize,
     /// One map every this many STFT frames
     map_every: usize,
-    /// Layout of the power map
+    /// Layout of the power map handed out: the visible part of the scan grid
     layout: MapLayout,
+    /// Full scan grid size including the margin, and the visible cells in it
+    grid_size: [usize; 2],
+    viewport: Viewport,
     peaks: PeakConfig,
     tracker: Tracker,
     /// Audio toward each track, by track id; empty if the sample rate has no integer
@@ -211,7 +229,13 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
         config.validate(sample_rate)?;
         tracking.validate().map_err(PipelineError::InvalidConfig)?;
 
-        let scan_grid = ScanGrid::new(&camera, config.grid_width, config.grid_z);
+        let scan_grid = ScanGrid::with_margin(
+            &camera,
+            config.grid_width,
+            config.grid_z,
+            config.grid_margin_deg.to_radians(),
+        );
+        let viewport = scan_grid.viewport();
 
         let n_bins = config.fft_len / 2 + 1;
         let df = sample_rate / config.fft_len as f64;
@@ -227,9 +251,13 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
         };
 
         println!(
-            "Grid {}x{}, bins {bins:?}, memory {} frames, map every {} frames",
+            "Grid {}x{} ({}x{} visible, margin {} degrees, at most {MAX_OFF_AXIS_DEG} off axis), \
+             bins {bins:?}, memory {} frames, map every {} frames",
             scan_grid.width(),
             scan_grid.height(),
+            viewport.width,
+            viewport.height,
+            config.grid_margin_deg,
             config.memory_frames,
             config.map_every
         );
@@ -274,9 +302,11 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
             map_every: config.map_every,
             layout: MapLayout {
                 camera,
-                grid_width: scan_grid.width(),
-                grid_height: scan_grid.height(),
+                grid_width: viewport.width,
+                grid_height: viewport.height,
             },
+            grid_size: [scan_grid.width(), scan_grid.height()],
+            viewport,
             peaks: peaks.clone(),
             tracker: Tracker::new(tracking.clone()),
             beams: Vec::new(),
@@ -286,12 +316,12 @@ impl<B: Beamformer<16>> Pipeline<16, B> {
 }
 
 impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
-    /// Index of the grid cell nearest to (col, row)
+    /// Index in the full grid of the visible cell nearest to (col, row) in visible cells
     fn point(&self, col: f64, row: f64) -> usize {
-        let [width, height] = [self.layout.grid_width, self.layout.grid_height];
-        let col = (col.round().max(0.0) as usize).min(width - 1);
-        let row = (row.round().max(0.0) as usize).min(height - 1);
-        row * width + col
+        let vp = self.viewport;
+        let col = (col.round().max(0.0) as usize).min(vp.width - 1) + vp.col;
+        let row = (row.round().max(0.0) as usize).min(vp.height - 1) + vp.row;
+        row * self.grid_size[0] + col
     }
 
     /// Power arriving coherently from `point` over the map band, see
@@ -319,21 +349,22 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
             .fold(f64::INFINITY, f64::min)
     }
 
-    /// Continue the tracks with the peaks of `power`, mark the ones with a peak in `steady`
-    /// (the map without transient frames) as steady, measure each track's coherent power above
-    /// the noise floor, hand each track the audio of its beam since the previous map, then
-    /// point the beams at the new track positions.
+    /// Continue the tracks with the visible peaks of `power` (the full grid), mark the ones
+    /// with a peak in `steady` (the map without transient frames) as steady, measure each
+    /// track's coherent power above the noise floor, hand each track the audio of its beam
+    /// since the previous map, then point the beams at the new track positions.
     fn update_tracks(&mut self, power: &[f64], steady: &[f64]) {
         let size = [self.layout.grid_width, self.layout.grid_height];
-        let peaks = find_peaks(power, size, &self.peaks);
+        let peaks = find_peaks_in(power, self.grid_size, self.viewport, &self.peaks);
         let steady_config = PeakConfig {
             range_db: STEADY_RANGE_DB,
             ..self.peaks.clone()
         };
-        let steady_peaks = find_peaks(steady, size, &steady_config);
+        let steady_peaks = find_peaks_in(steady, self.grid_size, self.viewport, &steady_config);
         // The current map is part of the floor window; no sample without any coherent power
-        // (e.g. a source that delivers zeros)
-        let [width, height] = size;
+        // (e.g. a source that delivers zeros). Over the full grid: a source outside the image
+        // is part of the background too.
+        let [width, height] = self.grid_size;
         let sample = (FLOOR_STRIDE / 2..height)
             .step_by(FLOOR_STRIDE)
             .flat_map(|row| {
@@ -432,6 +463,7 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
     let mut total_frames = 0;
     let mut out = vec![0.0; pipeline.beamformer.n_points()];
     let mut steady = vec![0.0; pipeline.beamformer.n_points()];
+    let mut visible = vec![0.0; pipeline.layout.grid_width * pipeline.layout.grid_height];
     let mut map_index = 0;
     // STFT frames since the last map
     let mut new_frames = 0;
@@ -485,7 +517,10 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
             map_index += 1;
 
             pipeline.update_tracks(&out, &steady);
-            let flow = on_map(&out, &pipeline.layout, pipeline.tracker.tracks())
+            pipeline
+                .viewport
+                .crop(&out, pipeline.grid_size[0], &mut visible);
+            let flow = on_map(&visible, &pipeline.layout, pipeline.tracker.tracks())
                 .map_err(PipelineError::MapHandler)?;
             if flow.is_break() {
                 break;
@@ -691,6 +726,107 @@ mod test {
                 track.id
             );
         }
+    }
+
+    /// Last visible map and tracks of a loud sine 52 degrees above the camera axis (the test
+    /// camera sees 39) next to a quieter one inside the image, CLEAN-SC, `margin_deg` of scan
+    /// grid margin; plus the inside source's grid cell
+    fn outside_source_maps(margin_deg: f64) -> (Vec<f64>, Vec<Track>, (f64, f64), [usize; 2]) {
+        let config = PipelineConfig {
+            grid_margin_deg: margin_deg,
+            ..PipelineConfig::default()
+        };
+        let camera = test_camera();
+        let inside = Point3::new(0.3, 0.1, config.grid_z);
+        let intrinsics = &camera.intrinsics;
+        let outside = camera.unproject(
+            intrinsics.cx,
+            -0.3 * intrinsics.height as f64,
+            config.grid_z,
+        );
+        let scene = Scene {
+            sample_rate: SAMPLE_RATE,
+            duration_s: 1.5,
+            mic_noise_params: MicNoiseParams {
+                seed: 1,
+                level_db: 20.0,
+            },
+            sources: vec![
+                Source {
+                    pos: inside,
+                    signal: Signal::Sine(Sine::new(1.0, 3000.0, 0.0)),
+                },
+                Source {
+                    pos: outside,
+                    signal: Signal::Sine(Sine::new(3.0, 3500.0, 0.0)),
+                },
+            ],
+        };
+        let mut sim = Simulator::new(scene, MicArray::uma16()).unwrap();
+        let pipeline = Pipeline::new(
+            SAMPLE_RATE,
+            &config,
+            &PeakConfig::default(),
+            &TrackerConfig::default(),
+            camera.clone(),
+            |steering| CleanSc::new(steering, 0.9, 10, 20.0, 1.5, true, true),
+        )
+        .unwrap();
+
+        let mut last_map = Vec::new();
+        let mut last_tracks = Vec::new();
+        let mut size = [0, 0];
+        run(&mut sim, pipeline, |power, layout, tracks| {
+            last_map = power.to_vec();
+            last_tracks = tracks.to_vec();
+            size = [layout.grid_width, layout.grid_height];
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+
+        // Source in grid cells, as `Intrinsics::scaled`
+        let (u, v) = camera.project(&inside);
+        let col = (u + 0.5) * size[0] as f64 / intrinsics.width as f64 - 0.5;
+        let row = (v + 0.5) * size[1] as f64 / intrinsics.height as f64 - 0.5;
+        (last_map, last_tracks, (col, row), size)
+    }
+
+    /// Largest value of the top row relative to the map maximum, in dB
+    fn top_row_db(map: &[f64], [width, _]: [usize; 2]) -> f64 {
+        let max = |values: &[f64]| values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        10.0 * (max(&map[..width]) / max(map)).log10()
+    }
+
+    /// With the scan grid margin, CLEAN-SC puts a source above the image on a margin cell: the
+    /// visible map peaks at the source inside, the top row stays dark and the only confirmed
+    /// track is the inside source. Without the margin the outside source is cleaned onto the
+    /// top border, where its main lobe reaches in.
+    #[test]
+    fn source_outside_the_image_stays_out() {
+        let (map, tracks, (col, row), size) = outside_source_maps(15.0);
+        let argmax = (0..map.len())
+            .max_by(|&a, &b| map[a].total_cmp(&map[b]))
+            .unwrap();
+        let (max_col, max_row) = ((argmax % size[0]) as f64, (argmax / size[0]) as f64);
+        assert!(
+            (max_col - col).hypot(max_row - row) <= 1.0,
+            "maximum at ({max_col}, {max_row}), inside source at ({col}, {row})"
+        );
+        let top = top_row_db(&map, size);
+        assert!(top < -15.0, "top row {top} dB with margin");
+        let confirmed: Vec<&Track> = tracks.iter().filter(|t| t.confirmed).collect();
+        assert!(!confirmed.is_empty(), "{tracks:?}");
+        for track in confirmed {
+            let dist = (track.col - col).hypot(track.row - row);
+            assert!(
+                dist <= 1.5,
+                "track {track:?}, inside source at ({col}, {row})"
+            );
+        }
+
+        let (map, _, _, size) = outside_source_maps(0.0);
+        let top = top_row_db(&map, size);
+        assert!(top > -6.0, "top row {top} dB without margin");
     }
 
     /// Mic noise alone, loud: every map has a maximum, but the coherent power from it stays at
