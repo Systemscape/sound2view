@@ -97,12 +97,13 @@ max_count = 5
 # minute: a pause between words is enough; a steady background source such as a fan is part of
 # it). Slider next to "Tracks" in the GUI
 min_above_floor_db = 8.0
-# Peaks closer than this to the image border, in grid cells, are dropped: sources outside the
-# camera's field of view have their maximum on the border
-edge_margin_cells = 1.0
+# Peaks closer than this to the border of the whole scan grid, in grid cells, are dropped (0:
+# none). Set 1 if pipeline.grid_margin_deg is 0: then the grid ends at the image border, where
+# sources outside the image have their maximum
+edge_margin_cells = 0.0
 # Extra dB above the floor a source needs at the left and right image border (0 in the center,
 # growing with the squared distance); central peaks are also preferred for max_count
-center_weight_db = 6.0
+center_weight_db = 2.0
 # Coherent share of the sound above 2 kHz a source needs, in dB (point sources and snaps about 0,
 # diffuse noise far below; "Coherence" in the GUI)
 min_coherence_db = -8.0

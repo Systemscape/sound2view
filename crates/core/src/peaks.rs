@@ -26,14 +26,17 @@ pub struct PeakConfig {
     /// gets no dot. The pipeline measures it (`Track::source_db`); the app applies it when
     /// showing tracks, so that it can change without a restart.
     pub min_above_floor_db: f64,
-    /// Peaks closer than this to the map border, in grid cells, are dropped: a source outside the
-    /// camera field of view has its maximum on the border (the scan grid ends there), so border
-    /// maxima are mostly sources outside the image, not in it
+    /// Peaks closer than this to the border of the whole scan grid, in grid cells, are dropped
+    /// (0: none). Without a scan grid margin (`pipeline.grid_margin_deg` 0) the grid ends at the
+    /// image border, where a source outside the image has its maximum, so 1 drops those; with
+    /// the margin the grid border is far outside the image and a maximum there is better kept,
+    /// since it suppresses the leakage toward the image for `min_dist_cells`
     pub edge_margin_cells: f64,
     /// Extra dB a track needs above the noise floor at the left and right image border, growing
     /// with the squared distance from the center (see [`center_penalty_db`]). The array resolves
     /// best on its axis; toward the edges the beams widen and sidelobes of sources outside the
-    /// image get in. Also ranks central peaks before peripheral ones for `max_count`.
+    /// image get in (less so with the scan grid margin). Also ranks central peaks before
+    /// peripheral ones for `max_count`.
     pub center_weight_db: f64,
     /// A track is shown only if its coherent share of the power above 2 kHz
     /// (`Track::source_upper_db`) is at least this, in dB: a point source or a snap reaches
@@ -49,8 +52,8 @@ impl Default for PeakConfig {
             min_dist_cells: 4.0,
             max_count: 5,
             min_above_floor_db: 8.0,
-            edge_margin_cells: 1.0,
-            center_weight_db: 6.0,
+            edge_margin_cells: 0.0,
+            center_weight_db: 2.0,
             min_coherence_db: -8.0,
         }
     }
@@ -333,12 +336,16 @@ mod test {
         assert!(find_peaks(&negative, SIZE, &PeakConfig::default()).is_empty());
     }
 
-    /// A source outside the map has its maximum on the border: dropped. It does not suppress a
-    /// weaker peak inside within `min_dist_cells`.
+    /// A source outside the map has its maximum on the border: dropped with `edge_margin_cells`
+    /// 1. It does not suppress a weaker peak inside within `min_dist_cells`.
     #[test]
     fn border_maximum_dropped() {
         let power = gaussians(&[(-1.0, 15.0, 2.0, 1.5), (3.0, 15.0, 0.8, 1.0)]);
-        let peaks = find_peaks(&power, SIZE, &PeakConfig::default());
+        let config = PeakConfig {
+            edge_margin_cells: 1.0,
+            ..PeakConfig::default()
+        };
+        let peaks = find_peaks(&power, SIZE, &config);
 
         assert_eq!(peaks.len(), 1);
         assert!((peaks[0].col - 3.0).abs() < 0.5, "col {}", peaks[0].col);
