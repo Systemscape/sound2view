@@ -19,7 +19,7 @@ use crate::{
         stft::{Stft, StftStream},
     },
     geometry::{camera::Camera, mic_array::MicArray, scan_grid::ScanGrid},
-    peaks::{PeakConfig, find_peaks},
+    peaks::{PeakConfig, center_penalty_db, find_peaks},
     tracking::{Track, Tracker, TrackerConfig},
 };
 
@@ -178,7 +178,9 @@ struct TrackAudio<const M: usize> {
 impl<const M: usize> TrackAudio<M> {
     /// Mic distances to the point of grid cell (col, row) at the focus distance
     fn distances(&self, track: &Track) -> [f64; M] {
-        let point = self.grid_camera.unproject(track.col, track.row, self.grid_z);
+        let point = self
+            .grid_camera
+            .unproject(track.col, track.row, self.grid_z);
         self.mic_array.get_distance_from(&point)
     }
 }
@@ -295,7 +297,13 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
     /// Power arriving coherently from `point` over the map band, see
     /// [`coherent_and_received_power`]
     fn coherent_power(&self, point: usize) -> f64 {
-        coherent_and_received_power(self.cov.estimate(), self.bins.clone(), &self.steering, point).0
+        coherent_and_received_power(
+            self.cov.estimate(),
+            self.bins.clone(),
+            &self.steering,
+            point,
+        )
+        .0
     }
 
     /// Coherent power from the cell nearest to (col, row) in dB above `floor`
@@ -305,7 +313,10 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
 
     /// Noise floor (linear): the lowest of `floor_samples`, infinite without samples
     fn floor(&self) -> f64 {
-        self.floor_samples.iter().copied().fold(f64::INFINITY, f64::min)
+        self.floor_samples
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// Continue the tracks with the peaks of `power`, mark the ones with a peak in `steady`
@@ -368,12 +379,18 @@ impl<const M: usize, B: Beamformer<M>> Pipeline<M, B> {
             // while a talker outside the image, who is no track, still shows as leakage
             let others = coherent_sum - coherent.max(0.0);
             let unexplained = (received - others).max(received * UPPER_UNEXPLAINED_MIN);
-            let share = if unexplained > 0.0 { coherent / unexplained } else { 0.0 };
+            let share = if unexplained > 0.0 {
+                coherent / unexplained
+            } else {
+                0.0
+            };
             track.source_db = above;
+            track.edge_penalty_db = center_penalty_db(track.col, track.row, size, &self.peaks);
             track.source_upper_db = 10.0 * share.max(1e-10).log10();
         }
 
-        self.beams.retain(|(id, _)| tracks.iter().any(|track| track.id == *id));
+        self.beams
+            .retain(|(id, _)| tracks.iter().any(|track| track.id == *id));
         let Some(audio) = &self.track_audio else {
             return;
         };
@@ -455,7 +472,9 @@ pub fn run<S: FrameSource<M>, B: Beamformer<M>, const M: usize>(
                 steady.copy_from_slice(&out);
             } else {
                 let cov = pipeline.steady_cov.estimate();
-                pipeline.beamformer.power_map(cov, pipeline.bins.clone(), &mut steady);
+                pipeline
+                    .beamformer
+                    .power_map(cov, pipeline.bins.clone(), &mut steady);
             }
             println!(
                 "map {map_index}: power_map {:.1} ms",
@@ -506,10 +525,7 @@ mod test {
     use super::{Pipeline, PipelineConfig, run};
     use crate::{
         FrameSource, Point3,
-        dsp::{
-            beam_signal::TRACK_SAMPLE_RATE,
-            beamformer::clean_sc::CleanSc,
-        },
+        dsp::{beam_signal::TRACK_SAMPLE_RATE, beamformer::clean_sc::CleanSc},
         geometry::mic_array::MicArray,
         peaks::PeakConfig,
         source::simulator::{
@@ -614,8 +630,10 @@ mod test {
         .unwrap();
 
         let min_db = PeakConfig::default().min_above_floor_db;
-        let confirmed: Vec<&Track> =
-            last.iter().filter(|t| t.confirmed && t.source_db >= min_db).collect();
+        let confirmed: Vec<&Track> = last
+            .iter()
+            .filter(|t| t.confirmed && t.source_db >= min_db)
+            .collect();
         assert_eq!(confirmed.len(), 2, "tracks: {last:?}");
 
         let intrinsics = &camera.intrinsics;
@@ -634,22 +652,44 @@ mod test {
                 })
                 .unwrap();
             let dist = (track.col - col).hypot(track.row - row);
-            assert!(dist < 1.0, "track at ({}, {}), source at ({col}, {row})", track.col, track.row);
+            assert!(
+                dist < 1.0,
+                "track at ({}, {}), source at ({col}, {row})",
+                track.col,
+                track.row
+            );
 
             // Each source gets about half of the received power, far above the quiet maps
             let above = track.source_db;
-            assert!(above > 10.0, "track {}: {above} dB above the floor", track.id);
+            assert!(
+                above > 10.0,
+                "track {}: {above} dB above the floor",
+                track.id
+            );
             let upper = track.source_upper_db;
-            assert!(upper > -5.0, "track {}: {upper} dB coherent above 2 kHz", track.id);
+            assert!(
+                upper > -5.0,
+                "track {}: {upper} dB coherent above 2 kHz",
+                track.id
+            );
 
             let (_, samples) = audio.iter().find(|(id, _)| *id == track.id).unwrap();
             // At least a second of audio
-            assert!(samples.len() > TRACK_SAMPLE_RATE as usize, "{} samples", samples.len());
+            assert!(
+                samples.len() > TRACK_SAMPLE_RATE as usize,
+                "{} samples",
+                samples.len()
+            );
             let other = sources.iter().find(|(p, _)| *p != pos).unwrap().1;
-            let own_db = 20.0 * (amplitude_at(samples, freq) / amplitude_at(samples, other)).log10();
+            let own_db =
+                20.0 * (amplitude_at(samples, freq) / amplitude_at(samples, other)).log10();
             // About 30 dB and 12 dB: depends on where the other source falls in this beam's
             // sidelobe pattern (near a null at 3.5 kHz, not at 3 kHz)
-            assert!(own_db > 8.0, "track {}: own source {own_db:.1} dB above the other", track.id);
+            assert!(
+                own_db > 8.0,
+                "track {}: own source {own_db:.1} dB above the other",
+                track.id
+            );
         }
     }
 
@@ -671,7 +711,10 @@ mod test {
         let min_db = PeakConfig::default().min_above_floor_db;
         let mut maps = 0;
         run(&mut sim, pipeline, |_power, _layout, tracks| {
-            assert!(tracks.iter().all(|t| t.source_db < min_db), "map {maps}: {tracks:?}");
+            assert!(
+                tracks.iter().all(|t| t.source_db < min_db),
+                "map {maps}: {tracks:?}"
+            );
             maps += 1;
             Ok(ControlFlow::Continue(()))
         })
@@ -781,7 +824,10 @@ mod test {
         // Talker at about column 25, hand at about 34 (+x is left in the image)
         let [with_skip, without] = [&shown_cols[0], &shown_cols[1]];
         assert_eq!(with_skip.len(), 1, "with skip: {with_skip:?}");
-        assert!(with_skip[0].0 < 28.0 && with_skip[0].1, "with skip: {with_skip:?}");
+        assert!(
+            with_skip[0].0 < 28.0 && with_skip[0].1,
+            "with skip: {with_skip:?}"
+        );
         assert_eq!(without.len(), 2, "without: {without:?}");
         assert!(without[0].0 < 28.0 && without[0].1, "talker: {without:?}");
         assert!(without[1].0 > 30.0 && !without[1].1, "hand: {without:?}");
@@ -838,7 +884,11 @@ mod test {
             .iter()
             .min_by(|a, b| a.col.total_cmp(&b.col))
             .unwrap();
-        assert!(talker_track.col < 28.0, "talker track at col {}", talker_track.col);
+        assert!(
+            talker_track.col < 28.0,
+            "talker track at col {}",
+            talker_track.col
+        );
         let upper = talker_track.source_upper_db;
         assert!(upper > -4.0, "talker's upper-band share {upper} dB");
     }
@@ -880,7 +930,10 @@ mod test {
         run(&mut sim, pipeline, |_power, _layout, tracks| {
             // The first second is the fan alone (18 maps); then the talker starts
             if maps < 17 {
-                assert!(tracks.iter().all(|t| t.source_db < min_db), "map {maps}: {tracks:?}");
+                assert!(
+                    tracks.iter().all(|t| t.source_db < min_db),
+                    "map {maps}: {tracks:?}"
+                );
             }
             confirmed = tracks
                 .iter()
@@ -896,6 +949,10 @@ mod test {
         // +x is left in the image (`Mount` turns the camera 180 degrees about z): the talker at
         // x = 0.6 is at about column 25, the fan at -0.5 at about 38
         assert!(track.col < 30.0, "track at col {}", track.col);
-        assert!(track.source_db > 10.0, "{} dB above the floor", track.source_db);
+        assert!(
+            track.source_db > 10.0,
+            "{} dB above the floor",
+            track.source_db
+        );
     }
 }

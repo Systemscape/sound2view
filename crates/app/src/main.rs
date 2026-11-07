@@ -12,11 +12,11 @@ use std::{
 use image::RgbaImage;
 use sound2view_core::{
     BoxError, FrameSource, ImageSource, Point3,
+    dsp::beam_signal::TRACK_SAMPLE_RATE,
     dsp::beamformer::{
         Normalization, clean_sc::CleanSc, delay_and_sum::Das, functional::Functional,
     },
     geometry::mic_array::MicArray,
-    dsp::beam_signal::TRACK_SAMPLE_RATE,
     peaks::PeakConfig,
     pipeline::{MapLayout, Pipeline, PipelineError, run},
     render,
@@ -30,11 +30,13 @@ use sound2view_core::{
 
 use crate::{
     config::{CONFIG_PATH, Config, Method},
+    gui_state::GuiState,
     speech::{SpeechConfig, SpeechDetector},
 };
 
 mod config;
 mod gui;
+mod gui_state;
 mod speech;
 mod theme;
 
@@ -42,6 +44,9 @@ mod theme;
 const MIC_MAPS: usize = 20;
 /// Frames timed in camshot mode
 const CAMSHOT_FRAMES: usize = 60;
+/// Cores the beamformers (rayon) leave free in the GUI: for the camera thread (frame copy) and
+/// drawing. With all cores busy computing maps the camera image stuttered on a Mac mini.
+const GUI_FREE_CORES: usize = 2;
 /// CLI modes wait this long for the user to grant camera access (macOS asks on the first run)
 const CAMERA_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -75,7 +80,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         "mic" => {
             let maps = match env::args().nth(2) {
-                Some(n) => n.parse().map_err(|_| format!("mic: not a map count: {n}"))?,
+                Some(n) => n
+                    .parse()
+                    .map_err(|_| format!("mic: not a map count: {n}"))?,
                 None => MIC_MAPS,
             };
             run_mic(&Config::load(CONFIG_PATH)?, maps)
@@ -175,34 +182,37 @@ fn run_configured<S: FrameSource<16>>(
 
     match b.method {
         Method::Das => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
-                Das::new(steering, true, Normalization::TrueLocation)
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    Das::new(steering, true, Normalization::TrueLocation)
+                })?;
             run(source, pipeline, on_map)
         }
         Method::Functional => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
-                Functional::new(
-                    steering,
-                    b.nu,
-                    b.functional_noise_removal,
-                    b.functional_equal_bins,
-                )
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    Functional::new(
+                        steering,
+                        b.nu,
+                        b.functional_noise_removal,
+                        b.functional_equal_bins,
+                    )
+                })?;
             run(source, pipeline, on_map)
         }
         Method::CleanSc => {
-            let pipeline = Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
-                CleanSc::new(
-                    steering,
-                    b.clean_gain,
-                    b.clean_max_iter,
-                    b.clean_stop_db,
-                    b.clean_beam_cells,
-                    true,
-                    b.clean_equal_bins,
-                )
-            })?;
+            let pipeline =
+                Pipeline::new(sample_rate, pipeline, peaks, tracking, camera, |steering| {
+                    CleanSc::new(
+                        steering,
+                        b.clean_gain,
+                        b.clean_max_iter,
+                        b.clean_stop_db,
+                        b.clean_beam_cells,
+                        true,
+                        b.clean_equal_bins,
+                    )
+                })?;
             run(source, pipeline, on_map)
         }
     }
@@ -237,7 +247,7 @@ fn save_maps(
     move |power, layout, tracks| {
         let shown: Vec<Track> = tracks
             .iter()
-            .filter(|track| track.confirmed && track.source_db >= peaks.min_above_floor_db)
+            .filter(|track| track.shown(&peaks))
             .cloned()
             .collect();
         let mut speech_ids = Vec::new();
@@ -309,6 +319,12 @@ impl TrackRecorder {
 const ICON_PNG: &[u8] = include_bytes!("../../../assets/logo-256.png");
 
 fn run_gui(config: Config) -> Result<(), Box<dyn Error>> {
+    leave_cores_for_gui();
+    // Settings menu values of the last run on top of sound2view.toml; the GUI saves only what
+    // differs from `base`
+    let base = GuiState::of_config(&config);
+    let saved = GuiState::load();
+    let config = saved.apply(&config);
     let icon = eframe::icon_data::from_png_bytes(ICON_PNG)?;
     eframe::run_native(
         "sound2view",
@@ -318,7 +334,19 @@ fn run_gui(config: Config) -> Result<(), Box<dyn Error>> {
                 .with_icon(icon),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(gui::App::new(cc, config)))),
+        Box::new(move |cc| Ok(Box::new(gui::App::new(cc, config, base, saved.camera)))),
     )?;
     Ok(())
+}
+
+/// Limit rayon's global pool to all cores but `GUI_FREE_CORES` (at least one thread)
+fn leave_cores_for_gui() {
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cores.saturating_sub(GUI_FREE_CORES).max(1);
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        eprintln!("rayon thread pool: {e}");
+    }
 }

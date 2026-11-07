@@ -7,3 +7,6 @@ track_*.wav
 .DS_Store
 *.swp
 !assets/*.png
+
+# GUI settings of the last run
+sound2view-gui.toml

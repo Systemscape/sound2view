@@ -110,7 +110,11 @@ pub fn source_fraction<const M: usize>(
     point: usize,
 ) -> f64 {
     let (coherent, received) = coherent_and_received_power(cov, bins, steering, point);
-    if received > 0.0 { coherent / received } else { 0.0 }
+    if received > 0.0 {
+        coherent / received
+    } else {
+        0.0
+    }
 }
 
 pub trait Beamformer<const M: usize> {
@@ -167,8 +171,14 @@ mod test {
         let mut cov = vec![SMatrix::<Complex64, 16, 16>::zeros(); FFT_LEN / 2 + 1];
         cov[BIN] = a * a.adjoint() + identity * Complex64::from(mean_mic_power);
         let (coherent, received) = coherent_and_received_power(&cov, BIN..=BIN, &steering, point);
-        assert!((coherent - mean_mic_power).abs() < 1e-9, "coherent {coherent}");
-        assert!((received - 2.0 * mean_mic_power).abs() < 1e-9, "received {received}");
+        assert!(
+            (coherent - mean_mic_power).abs() < 1e-9,
+            "coherent {coherent}"
+        );
+        assert!(
+            (received - 2.0 * mean_mic_power).abs() < 1e-9,
+            "received {received}"
+        );
         let at_source = source_fraction(&cov, BIN..=BIN, &steering, point);
         assert!((at_source - 0.5).abs() < 1e-9, "at the source: {at_source}");
         let corner = source_fraction(&cov, BIN..=BIN, &steering, 0);

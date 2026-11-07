@@ -241,7 +241,10 @@ impl<const M: usize> Beamformer<M> for CleanSc<M> {
                         self.clean_bin(bin, threshold, &mut single);
                         let max = single.iter().copied().fold(0.0, f64::max);
                         if max > 0.0 {
-                            clean.iter_mut().zip(&single).for_each(|(c, s)| *c += s / max);
+                            clean
+                                .iter_mut()
+                                .zip(&single)
+                                .for_each(|(c, s)| *c += s / max);
                         }
                     } else {
                         self.clean_bin(bin, threshold, &mut clean);
@@ -463,8 +466,16 @@ mod test {
         cov[weak_bin] = (a_1 * a_1.adjoint()).scale(1e-3);
 
         let power = clean_map_equal(&cov, BIN..=weak_bin, 1.0, 40.0, true, true);
-        assert!((power[i_0] - 1.0).abs() < 1e-9, "strong source {}", power[i_0]);
-        assert!((power[i_1] - 1.0).abs() < 1e-9, "weak source {}", power[i_1]);
+        assert!(
+            (power[i_0] - 1.0).abs() < 1e-9,
+            "strong source {}",
+            power[i_0]
+        );
+        assert!(
+            (power[i_1] - 1.0).abs() < 1e-9,
+            "weak source {}",
+            power[i_1]
+        );
         let rest: f64 = power.iter().sum::<f64>() - 2.0;
         assert!(rest.abs() < 1e-9, "elsewhere {rest}");
 

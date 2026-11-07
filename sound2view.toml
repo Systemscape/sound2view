@@ -92,12 +92,24 @@ max_count = 5
 # minute: a pause between words is enough; a steady background source such as a fan is part of
 # it). Slider next to "Tracks" in the GUI
 min_above_floor_db = 8.0
+# Peaks closer than this to the image border, in grid cells, are dropped: sources outside the
+# camera's field of view have their maximum on the border
+edge_margin_cells = 1.0
+# Extra dB above the floor a source needs at the left and right image border (0 in the center,
+# growing with the squared distance); central peaks are also preferred for max_count
+center_weight_db = 6.0
+# Coherent share of the sound above 2 kHz a source needs, in dB (point sources and snaps about 0,
+# diffuse noise far below; "Coherence" in the GUI)
+min_coherence_db = -8.0
 
 [tracking]
-# A peak continues a track if it is at most this far away, in grid cells
-max_dist_cells = 6.0
-# Maps with a matching peak (not in a row) until a track is shown (and recorded in the CLI modes)
+# A peak continues a track if it is at most this far away, in grid cells (noise maxima jump
+# farther and keep starting new tracks)
+max_dist_cells = 4.0
+# A track is shown (and recorded in the CLI modes) after a matching peak in min_hits of the last
+# confirm_window maps (not necessarily in a row)
 min_hits = 3
+confirm_window = 5
 # Maps in a row without a matching peak until a track is dropped
 max_missed = 5
 # Weight of the new peak in the smoothed position, in (0, 1]; 1 follows the peak exactly (less

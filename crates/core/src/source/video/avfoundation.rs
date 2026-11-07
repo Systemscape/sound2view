@@ -24,16 +24,17 @@ use objc2_av_foundation::{
     AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceDiscoverySession,
     AVCaptureDeviceFormat, AVCaptureDeviceInput, AVCaptureDevicePosition,
     AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal, AVCaptureOutput,
-    AVCaptureSession, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
-    AVFrameRateRange, AVMediaTypeVideo,
+    AVCaptureSession, AVCaptureSessionPresetInputPriority, AVCaptureVideoDataOutput,
+    AVCaptureVideoDataOutputSampleBufferDelegate, AVFrameRateRange, AVMediaTypeVideo,
 };
 use objc2_core_foundation::CFString;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetDimensions};
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
     CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey,
-    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferHeightKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    kCVReturnSuccess,
 };
 use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
@@ -44,6 +45,9 @@ use crate::{ImageSource, VideoFrame};
 
 /// `next_frame` gives up after this long without a frame (e.g. camera unplugged)
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+/// Formats that cannot reach this frame rate (or the requested one, if lower) are taken only if
+/// nothing else fits
+const MIN_LIVE_FPS: f64 = 25.0;
 
 /// Request camera access; required once before any other camera call (macOS asks the user on
 /// the first run). Returns immediately, see [`is_authorized`].
@@ -148,28 +152,36 @@ impl CameraSource {
                         a.distance(width, height, fps),
                         b.distance(width, height, fps),
                     );
-                    a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
+                    a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2))
                 })
                 .ok_or_else(|| VideoError::Camera("camera lists no video formats".to_string()))?;
-            if (option.width, option.height) != (width as i32, height as i32) {
-                eprintln!(
-                    "camera {index}: requested {width}x{height}, got {}x{}",
-                    option.width, option.height
-                );
-            }
+            let (min_fps, max_fps) = option.fps_range();
+            eprintln!(
+                "camera {index}: {}x{} at {min_fps:.0}-{max_fps:.0} fps, {} (requested \
+                 {width}x{height} at {fps:.0} fps)",
+                option.width,
+                option.height,
+                fourcc(&option.format)
+            );
 
             let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
                 .map_err(ns_error)?;
 
-            // 32BGRA: AVFoundation converts from the device format, no decoding on our side
+            // 32BGRA at the format's own size: AVFoundation converts from the device format, no
+            // decoding on our side. Without the size it may scale the output down.
             let output = unsafe { AVCaptureVideoDataOutput::new() };
-            // SAFETY: CFString and NSString are toll-free bridged
-            let key: &NSString = unsafe {
-                &*(kCVPixelBufferPixelFormatTypeKey as *const CFString).cast::<NSString>()
-            };
             let pixel_format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_32BGRA);
-            let value: &AnyObject = &pixel_format;
-            let settings = NSDictionary::from_slices(&[key], &[value]);
+            let output_width = NSNumber::numberWithInt(option.width);
+            let output_height = NSNumber::numberWithInt(option.height);
+            let keys = unsafe {
+                [
+                    cf_key(kCVPixelBufferPixelFormatTypeKey),
+                    cf_key(kCVPixelBufferWidthKey),
+                    cf_key(kCVPixelBufferHeightKey),
+                ]
+            };
+            let values: [&AnyObject; 3] = [&pixel_format, &output_width, &output_height];
+            let settings = NSDictionary::from_slices(&keys, &values);
             unsafe {
                 output.setVideoSettings(Some(&settings));
                 output.setAlwaysDiscardsLateVideoFrames(true);
@@ -197,8 +209,9 @@ impl CameraSource {
                 session.addInput(&input);
                 session.addOutput(&output);
 
-                // Setting the active format switches the session to the input-priority preset,
-                // so the session keeps it instead of choosing its own
+                // Input priority: the session keeps the device format set below instead of
+                // choosing its own (setting the format switches to it as well, explicit is safer)
+                session.setSessionPreset(AVCaptureSessionPresetInputPriority);
                 if let Err(e) = device.lockForConfiguration() {
                     session.commitConfiguration();
                     return Err(ns_error(e));
@@ -296,14 +309,14 @@ unsafe fn to_rgba(sample_buffer: &CMSampleBuffer) -> Option<VideoFrame> {
     let stride = CVPixelBufferGetBytesPerRow(&buffer);
     let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
 
-    let mut pixels = Vec::with_capacity(width * height * 4);
+    let mut pixels = vec![0; width * height * 4];
     if !base.is_null() {
-        for row in 0..height {
+        for (row, out) in pixels.chunks_exact_mut(width * 4).enumerate() {
             // SAFETY: the locked buffer holds `height` rows of `stride` bytes, each starting
             // with `width` BGRA pixels
             let line = unsafe { slice::from_raw_parts(base.add(row * stride), width * 4) };
-            for bgra in line.chunks_exact(4) {
-                pixels.extend_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
+            for (rgba, bgra) in out.chunks_exact_mut(4).zip(line.chunks_exact(4)) {
+                rgba.copy_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
             }
         }
     }
@@ -329,13 +342,16 @@ impl FormatOption {
         unsafe { (self.range.minFrameRate(), self.range.maxFrameRate()) }
     }
 
-    /// Sort key against the request: resolution mismatch in pixels, then how far `fps` lies
+    /// Sort key against the request, smaller is better: too slow for a live image (cannot
+    /// reach `fps` or `MIN_LIVE_FPS`, whichever is lower; a camera may list 1920x1080 also
+    /// uncompressed at 5 fps), then the resolution mismatch in pixels, then how far `fps` lies
     /// outside the frame rate range
-    fn distance(&self, width: u32, height: u32, fps: f64) -> (u64, f64) {
+    fn distance(&self, width: u32, height: u32, fps: f64) -> (bool, u64, f64) {
         let pixels = self.width.abs_diff(width as i32) + self.height.abs_diff(height as i32);
         let (min_fps, max_fps) = self.fps_range();
+        let too_slow = max_fps < fps.min(MIN_LIVE_FPS);
         let fps_off = (min_fps - fps).max(fps - max_fps).max(0.0);
-        (u64::from(pixels), fps_off)
+        (too_slow, u64::from(pixels), fps_off)
     }
 
     /// Frame duration for `fps`, clamped to the range; the range's own durations at its ends
@@ -393,6 +409,14 @@ fn format_options(device: &AVCaptureDevice) -> Vec<FormatOption> {
 fn fourcc(format: &AVCaptureDeviceFormat) -> String {
     let code = unsafe { format.formatDescription().media_sub_type() };
     code.to_be_bytes().iter().map(|&b| b as char).collect()
+}
+
+/// A CoreVideo key as `NSString` (toll-free bridged)
+///
+/// # Safety
+/// `key` must be a valid CFString constant.
+unsafe fn cf_key(key: &'static CFString) -> &'static NSString {
+    unsafe { &*(key as *const CFString).cast::<NSString>() }
 }
 
 fn video_media_type() -> &'static NSString {

@@ -3,7 +3,7 @@
 
 use std::{error::Error, fs, io};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sound2view_core::{
     geometry::camera::{Camera, Intrinsics, Mount},
     peaks::PeakConfig,
@@ -142,7 +142,7 @@ impl CameraConfig {
 }
 
 /// Beamforming method
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
     /// Delay and sum with diagonal removal and true-location normalization
@@ -183,7 +183,7 @@ impl Method {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BeamformerConfig {
     pub method: Method,
@@ -282,5 +282,17 @@ impl Config {
         self.pipeline
             .validate(self.audio.sample_rate as f64)
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod shipped_config_test {
+    use super::Config;
+
+    /// The example `sound2view.toml` in the repository root parses and is valid.
+    #[test]
+    fn shipped_config_is_valid() {
+        let config: Config = toml::from_str(include_str!("../../../sound2view.toml")).unwrap();
+        config.validate().unwrap();
     }
 }

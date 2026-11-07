@@ -230,11 +230,18 @@ mod test {
     /// Beam signal toward `target` over the whole scene, with decimation `factor`
     fn beam_output(scene: &Scene, target: &Point3, factor: usize) -> Vec<f32> {
         let mic_array = MicArray::uma16();
-        let samples = read_all(&mut Simulator::new(scene.clone(), mic_array.clone()).unwrap(), 4096);
+        let samples = read_all(
+            &mut Simulator::new(scene.clone(), mic_array.clone()).unwrap(),
+            4096,
+        );
         let stft = Stft::new(FFT_LEN);
         let sample_rate = factor as f64 * TRACK_SAMPLE_RATE;
-        let mut beam =
-            BeamSignal::new(FFT_LEN, stft.scale(), sample_rate, &mic_array.get_distance_from(target));
+        let mut beam = BeamSignal::new(
+            FFT_LEN,
+            stft.scale(),
+            sample_rate,
+            &mic_array.get_distance_from(target),
+        );
         let mut stream = StftStream::<16>::new(stft);
         stream.push(&samples, |snapshots, _l| beam.push_frame(snapshots));
         beam.take_output()
@@ -318,7 +325,10 @@ mod test {
         // Both sources have amplitude 1 at 1 m; B is about 1.17 m from the array center
         let suppression_db = 20.0 * (a / b).log10();
         // About 17 dB at 3.4 kHz with sources 62 degrees apart
-        assert!(suppression_db > 15.0, "A {a}, B {b}: {suppression_db:.1} dB");
+        assert!(
+            suppression_db > 15.0,
+            "A {a}, B {b}: {suppression_db:.1} dB"
+        );
     }
 
     /// The decimation filter passes speech frequencies and blocks what would alias.

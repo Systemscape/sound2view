@@ -7,12 +7,12 @@ use std::{
         mpsc::{Receiver, TrySendError, sync_channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, FontId, Layout, Margin, PopupCloseBehavior, Pos2,
-    Rect, RichText, Sense, Slider, Stroke, TextureHandle, TextureOptions,
+    self, Align2, Color32, ColorImage, FontId, Margin, PopupCloseBehavior, Pos2, Rect, RichText,
+    Sense, Slider, Stroke, TextureHandle, TextureOptions,
     containers::menu::{MenuButton, MenuConfig},
     pos2, vec2,
 };
@@ -30,6 +30,7 @@ use sound2view_core::{
 
 use crate::{
     config::{BeamformerConfig, CameraConfig, Config, Method},
+    gui_state::{GUI_STATE_PATH, GuiState},
     run_configured,
     speech::{SpeechDetector, SpeechStatus},
     theme,
@@ -79,13 +80,17 @@ impl DeviceStatus {
     }
 }
 
-/// Status dot with short text; the full message as tooltip
-fn status_indicator(ui: &mut egui::Ui, status: &DeviceStatus, device: &str) {
-    ui.label(RichText::new(status.short(device)).color(theme::TEXT_WEAK))
-        .on_hover_text(status.message(device));
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+/// Status dot with short text; the full message and `detail` (if not empty) as tooltip
+fn status_indicator(ui: &mut egui::Ui, status: &DeviceStatus, device: &str, detail: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), 4.0, status.color());
+    let mut tooltip = status.message(device);
+    if !detail.is_empty() {
+        tooltip += &format!("\n{detail}");
+    }
+    ui.label(RichText::new(status.short(device)).color(theme::TEXT_WEAK))
+        .on_hover_text(tooltip);
 }
 
 /// Wait between attempts to open the camera or the mic
@@ -125,20 +130,26 @@ const MARKER_RADIUS_MIN: f32 = 8.0;
 const MARKER_FONT: f32 = 0.02;
 const MARKER_FONT_MIN: f32 = 15.0;
 
-/// Space between the controls of the top bar, and the width of its sliders
+/// Space between the status indicators, and the slider width in the settings menu
 const GAP: f32 = 12.0;
-const SLIDER_WIDTH: f32 = 80.0;
+const MENU_SLIDER_WIDTH: f32 = 160.0;
 /// Band slider: rail width, handle radius and the text to its right
 const BAND_RAIL_WIDTH: f32 = 200.0;
 const BAND_TEXT_WIDTH: f32 = 90.0;
 const HANDLE_RADIUS: f32 = 6.0;
-const SETTINGS_MENU_WIDTH: f32 = 260.0;
+const SETTINGS_MENU_WIDTH: f32 = 340.0;
+/// Status and settings in the top-right corner: distance from the window edge, opacity while the
+/// pointer is elsewhere, and how close it must come to show them fully
+const CONTROLS_OFFSET: f32 = 20.0;
+const CONTROLS_IDLE_OPACITY: f32 = 0.3;
+const CONTROLS_HOVER_MARGIN: f32 = 40.0;
 
 /// Slider limits
 const NU_RANGE: RangeInclusive<f64> = 1.0..=100.0;
 const CLEAN_MAX_ITER_RANGE: RangeInclusive<usize> = 1..=30;
 const DB_RANGE_RANGE: RangeInclusive<f64> = 0.1..=20.0;
 const SOURCE_RANGE: RangeInclusive<f64> = 0.0..=15.0;
+const COHERENCE_RANGE: RangeInclusive<f64> = -20.0..=0.0;
 /// Speech threshold limits
 const SPEECH_THRESHOLD_MIN: f32 = 0.3;
 const SPEECH_THRESHOLD_MAX: f32 = 0.99;
@@ -175,8 +186,9 @@ pub struct App {
     last_map: Option<MapData>,
     /// Overlay range in dB below the map maximum; applies immediately
     db_range: f64,
-    /// Peak search of the pipeline, for the tooltip; `enabled` (show the dots) and
-    /// `min_above_floor_db` (which tracks are shown, applies immediately) are edited in the GUI
+    /// Peak search of the pipeline, for the tooltips; `enabled` (show the dots),
+    /// `min_above_floor_db` and `min_coherence_db` (which tracks are shown) are edited in the
+    /// GUI and apply immediately
     peaks: PeakConfig,
     /// Tracking of the pipeline, for the tooltip
     tracking: TrackerConfig,
@@ -192,12 +204,20 @@ pub struct App {
     settings: PipelineSettings,
     /// Settings read by the audio thread; updated from `settings` when no slider is dragged
     shared_settings: Arc<Mutex<PipelineSettings>>,
-    /// Camera selection, status and list, shared with the camera thread
+    /// Camera selection, status, list and measured format, shared with the camera thread
     camera: Arc<CameraShared>,
     /// `camera.name` from the config, shown for `CameraChoice::Auto`
     camera_name: String,
     /// Written by the audio thread
     audio_status: Arc<Mutex<DeviceStatus>>,
+    /// The settings of `sound2view.toml`; only what differs from them is saved
+    base: GuiState,
+    /// Last written to `GUI_STATE_PATH` (the differences from `base`)
+    saved: GuiState,
+    /// Screen area of the status and settings controls in the previous frame, for the fade
+    controls_rect: Rect,
+    /// Settings menu open in the previous frame
+    menu_open: bool,
 }
 
 impl eframe::App for App {
@@ -223,36 +243,22 @@ impl eframe::App for App {
 
         let camera_status = self.camera.status.lock().unwrap().clone();
         let audio_status = self.audio_status.lock().unwrap().clone();
+        redraw_map |= self.controls_overlay(ui, &camera_status, &audio_status);
 
-        let top_frame = egui::Frame::new()
-            .fill(theme::PANEL)
-            .inner_margin(Margin::symmetric(16, 10));
-        egui::Panel::top("controls")
-            .frame(top_frame)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().slider_width = SLIDER_WIDTH;
-                    ui.label(RichText::new("sound2view").strong().size(18.0));
-                    ui.add_space(GAP);
-                    redraw_map |= self.controls(ui);
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        self.settings_menu(ui);
-                        ui.add_space(GAP);
-                        status_indicator(ui, &camera_status, "Camera");
-                        ui.add_space(GAP);
-                        status_indicator(ui, &audio_status, "Mic");
-                    });
-                });
-            });
-
-        // Apply pipeline settings only when no slider is dragged: each change restarts the
-        // pipeline, and the sliding covariance needs a few frames for the first map
+        // Apply and save the settings only when no slider is dragged: each pipeline change
+        // restarts the pipeline, and the sliding covariance needs a few frames for the first map
         let pointer_down = ui.input(|i| i.pointer.any_down());
         if !pointer_down {
-            let mut shared = self.shared_settings.lock().unwrap();
-            if *shared != self.settings {
-                *shared = self.settings.clone();
+            {
+                let mut shared = self.shared_settings.lock().unwrap();
+                if *shared != self.settings {
+                    *shared = self.settings.clone();
+                }
+            }
+            let changes = self.gui_state().changes_from(&self.base);
+            if changes != self.saved {
+                changes.save();
+                self.saved = changes;
             }
         }
 
@@ -308,8 +314,15 @@ impl eframe::App for App {
                         && let Some(map) = &self.last_map
                     {
                         let hover = ui.input(|input| input.pointer.hover_pos());
-                        let min_db = self.peaks.min_above_floor_db;
-                        draw_tracks(painter, rect, map.size, &map.tracks, &map.speech, hover, min_db);
+                        draw_tracks(
+                            painter,
+                            rect,
+                            map.size,
+                            &map.tracks,
+                            &map.speech,
+                            hover,
+                            &self.peaks,
+                        );
                     }
                 }
 
@@ -329,7 +342,14 @@ impl eframe::App for App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, config: Config) -> Self {
+    /// `config` with the saved GUI settings already applied, `base` the settings of
+    /// `sound2view.toml` alone, `camera` the saved camera name (`None`: automatic)
+    pub fn new(
+        cc: &eframe::CreationContext,
+        config: Config,
+        base: GuiState,
+        camera: Option<String>,
+    ) -> Self {
         theme::apply(&cc.egui_ctx);
 
         let settings = PipelineSettings {
@@ -338,16 +358,17 @@ impl App {
         };
         let shared_settings = Arc::new(Mutex::new(settings.clone()));
         let camera = Arc::new(CameraShared {
-            choice: Mutex::new(CameraChoice::Auto),
+            choice: Mutex::new(camera.map_or(CameraChoice::Auto, CameraChoice::Name)),
             status: Mutex::new(DeviceStatus::Opening),
             cameras: Mutex::new(Vec::new()),
+            measured: Mutex::new(String::new()),
         });
         let audio_status = Arc::new(Mutex::new(DeviceStatus::Opening));
         let shared_speech_enabled = Arc::new(AtomicBool::new(config.speech.enabled));
         let shared_speech_threshold =
             Arc::new(AtomicU32::new(config.speech.on_threshold.to_bits()));
 
-        Self {
+        let mut app = Self {
             rx: spawn_camera(
                 cc.egui_ctx.clone(),
                 config.camera.clone(),
@@ -376,80 +397,151 @@ impl App {
             camera,
             camera_name: config.camera.name.clone(),
             audio_status,
+            base,
+            saved: GuiState::default(),
+            controls_rect: Rect::NOTHING,
+            menu_open: false,
+        };
+        // The file as loaded; written again only after a change
+        app.saved = app.gui_state().changes_from(&app.base);
+        app
+    }
+
+    /// All settings menu values
+    fn gui_state(&self) -> GuiState {
+        let camera = match &*self.camera.choice.lock().unwrap() {
+            CameraChoice::Auto => None,
+            CameraChoice::Name(name) => Some(name.clone()),
+        };
+        GuiState {
+            beamformer: Some(self.settings.beamformer.clone()),
+            f_lo_hz: Some(self.settings.pipeline.f_lo_hz),
+            f_hi_hz: Some(self.settings.pipeline.f_hi_hz),
+            skip_transients: Some(self.settings.pipeline.skip_transients),
+            db_range: Some(self.db_range),
+            tracks: Some(self.peaks.enabled),
+            min_above_floor_db: Some(self.peaks.min_above_floor_db),
+            min_coherence_db: Some(self.peaks.min_coherence_db),
+            speech: Some(self.speech_enabled),
+            speech_threshold: Some(self.speech_threshold),
+            camera,
         }
     }
 
-    /// Camera dropdown: "Auto" (first camera matching `camera.name`) or one listed camera.
-    /// The field of view in the config belongs to the configured camera, so the overlay only
-    /// fits other cameras with the same field of view.
-    fn camera_control(&self, ui: &mut egui::Ui) {
-        let cameras = self.camera.cameras.lock().unwrap().clone();
-        let current = self.camera.choice.lock().unwrap().clone();
-        let auto_label = format!("Auto ({})", self.camera_name);
-        let entry_label = |entry: &CameraEntry| format!("{} ({})", entry.name, entry.index);
-
-        let selected_text = match &current {
-            CameraChoice::Auto => auto_label.clone(),
-            CameraChoice::Index(index) => cameras
-                .iter()
-                .find(|entry| entry.index == *index)
-                .map_or_else(|| format!("Camera {index}"), entry_label),
+    /// Mic and camera status and the settings button in the top-right corner, over the image.
+    /// Faint until the pointer comes near or the menu is open, so they hide little of the
+    /// picture. Returns true if the overlay needs a redraw.
+    fn controls_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        camera_status: &DeviceStatus,
+        audio_status: &DeviceStatus,
+    ) -> bool {
+        let ctx = ui.ctx().clone();
+        let near = ctx.pointer_hover_pos().is_some_and(|pos| {
+            self.controls_rect
+                .expand(CONTROLS_HOVER_MARGIN)
+                .contains(pos)
+        });
+        let opacity = if near || self.menu_open {
+            1.0
+        } else {
+            CONTROLS_IDLE_OPACITY
         };
 
-        let mut choice = current.clone();
-        label(ui, "Camera").on_hover_text(format!(
-            "Auto opens the first camera whose name contains \"{}\" (camera.name). The overlay \
-             only lines up with cameras that match the configured field of view or calibration.",
-            self.camera_name
-        ));
-        egui::ComboBox::from_id_salt("camera")
-            .selected_text(selected_text)
-            .width(CAMERA_COMBO_WIDTH)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut choice, CameraChoice::Auto, auto_label);
-                for entry in &cameras {
-                    let label = entry_label(entry);
-                    ui.selectable_value(&mut choice, CameraChoice::Index(entry.index), label);
-                }
+        let mut redraw_map = false;
+        let response = egui::Area::new(egui::Id::unique("controls"))
+            .anchor(Align2::RIGHT_TOP, vec2(-CONTROLS_OFFSET, CONTROLS_OFFSET))
+            .show(&ctx, |ui| {
+                ui.set_opacity(opacity);
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            status_indicator(ui, audio_status, "Mic", "");
+                            ui.add_space(GAP);
+                            let measured = self.camera.measured.lock().unwrap().clone();
+                            status_indicator(ui, camera_status, "Camera", &measured);
+                            ui.add_space(GAP);
+                            redraw_map = self.settings_menu(ui);
+                        });
+                    });
             });
-
-        if choice != current {
-            *self.camera.choice.lock().unwrap() = choice;
-            set_status(ui.ctx(), &self.camera.status, DeviceStatus::Opening);
-        }
+        self.controls_rect = response.response.rect;
+        redraw_map
     }
 
-    /// Rarely changed settings behind a button: the camera and the functional options
-    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+    /// The settings button and its menu with all settings; returns true if the overlay needs
+    /// a redraw
+    fn settings_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let config = MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
-        MenuButton::new("\u{2699} Settings")
+        let (_, inner) = MenuButton::new("\u{2699} Settings")
             .config(config)
             .ui(ui, |ui| {
                 ui.set_min_width(SETTINGS_MENU_WIDTH);
-                ui.horizontal(|ui| self.camera_control(ui));
-                ui.separator();
-                label(ui, "Functional beamforming");
-                let beamformer = &mut self.settings.beamformer;
-                ui.checkbox(&mut beamformer.functional_noise_removal, "Noise removal")
-                    .on_hover_text(NOISE_REMOVAL_HELP);
-                ui.checkbox(&mut beamformer.functional_equal_bins, "Equal bins")
-                    .on_hover_text(EQUAL_BINS_HELP);
-                label(ui, "CLEAN-SC");
-                ui.checkbox(&mut beamformer.clean_equal_bins, "Equal bins")
-                    .on_hover_text(CLEAN_EQUAL_BINS_HELP);
-                ui.separator();
-                label(ui, "Map");
-                ui.checkbox(&mut self.settings.pipeline.skip_transients, "Skip transients")
-                    .on_hover_text(SKIP_TRANSIENTS_HELP);
+                ui.spacing_mut().slider_width = MENU_SLIDER_WIDTH;
+                self.menu_contents(ui)
             });
+        self.menu_open = inner.is_some();
+        inner.is_some_and(|inner| inner.inner)
     }
 
-    /// Beamformer with its parameter, band, overlay range, tracks and speech; returns true if
-    /// the overlay needs a redraw
-    fn controls(&mut self, ui: &mut egui::Ui) -> bool {
-        let beamformer = &mut self.settings.beamformer;
-        let pipeline = &mut self.settings.pipeline;
+    /// All settings, in sections; returns true if the overlay needs a redraw
+    fn menu_contents(&mut self, ui: &mut egui::Ui) -> bool {
+        heading(ui, "Beamformer");
+        self.beamformer_controls(ui);
 
+        ui.separator();
+        heading(ui, "Map");
+        let pipeline = &mut self.settings.pipeline;
+        band_slider(ui, &mut pipeline.f_lo_hz, &mut pipeline.f_hi_hz).on_hover_text(BAND_HELP);
+        let redraw_map = ui
+            .horizontal(|ui| {
+                label(ui, "Overlay").on_hover_text(OVERLAY_HELP);
+                ui.add(
+                    Slider::new(&mut self.db_range, DB_RANGE_RANGE)
+                        .logarithmic(true)
+                        .suffix(" dB")
+                        .max_decimals(1),
+                )
+                .on_hover_text(OVERLAY_HELP)
+                .changed()
+            })
+            .inner;
+        ui.checkbox(
+            &mut self.settings.pipeline.skip_transients,
+            "Skip transients",
+        )
+        .on_hover_text(SKIP_TRANSIENTS_HELP);
+
+        ui.separator();
+        heading(ui, "Sources");
+        self.source_controls(ui);
+
+        ui.separator();
+        heading(ui, "Speech");
+        self.speech_controls(ui);
+
+        ui.separator();
+        heading(ui, "Camera");
+        self.camera_control(ui);
+
+        ui.separator();
+        ui.label(
+            RichText::new(format!(
+                "Changes are saved to {GUI_STATE_PATH}; delete it to use sound2view.toml again."
+            ))
+            .small()
+            .color(theme::TEXT_WEAK),
+        );
+        redraw_map
+    }
+
+    /// Method, its main parameter and its options
+    fn beamformer_controls(&mut self, ui: &mut egui::Ui) {
+        let beamformer = &mut self.settings.beamformer;
         let method_help = beamformer.method.description();
         egui::ComboBox::from_id_salt("method")
             .selected_text(beamformer.method.label())
@@ -462,17 +554,22 @@ impl App {
             .response
             .on_hover_text(method_help);
 
-        // Parameter of the selected method (the functional checkboxes are in the settings menu)
         match beamformer.method {
             Method::Das => {}
             Method::Functional => {
-                label(ui, "nu").on_hover_text(NU_HELP);
-                ui.add(
-                    Slider::new(&mut beamformer.nu, NU_RANGE)
-                        .logarithmic(true)
-                        .max_decimals(0),
-                )
-                .on_hover_text(NU_HELP);
+                ui.horizontal(|ui| {
+                    label(ui, "nu").on_hover_text(NU_HELP);
+                    ui.add(
+                        Slider::new(&mut beamformer.nu, NU_RANGE)
+                            .logarithmic(true)
+                            .max_decimals(0),
+                    )
+                    .on_hover_text(NU_HELP);
+                });
+                ui.checkbox(&mut beamformer.functional_noise_removal, "Noise removal")
+                    .on_hover_text(NOISE_REMOVAL_HELP);
+                ui.checkbox(&mut beamformer.functional_equal_bins, "Equal bins")
+                    .on_hover_text(EQUAL_BINS_HELP);
             }
             Method::CleanSc => {
                 let sources_help = format!(
@@ -481,80 +578,94 @@ impl App {
                      {} dB below the strongest bin add nothing.",
                     beamformer.clean_stop_db
                 );
-                label(ui, "Sources").on_hover_text(&sources_help);
-                ui.add(Slider::new(
-                    &mut beamformer.clean_max_iter,
-                    CLEAN_MAX_ITER_RANGE,
-                ))
-                .on_hover_text(sources_help);
+                ui.horizontal(|ui| {
+                    label(ui, "Sources").on_hover_text(&sources_help);
+                    ui.add(Slider::new(
+                        &mut beamformer.clean_max_iter,
+                        CLEAN_MAX_ITER_RANGE,
+                    ))
+                    .on_hover_text(&sources_help);
+                });
+                ui.checkbox(&mut beamformer.clean_equal_bins, "Equal bins")
+                    .on_hover_text(CLEAN_EQUAL_BINS_HELP);
             }
         }
+    }
 
-        ui.add_space(GAP);
-        band_slider(ui, &mut pipeline.f_lo_hz, &mut pipeline.f_hi_hz).on_hover_text(BAND_HELP);
-
-        ui.add_space(GAP);
-        label(ui, "Overlay").on_hover_text(OVERLAY_HELP);
-        let db_range_changed = ui
-            .add(
-                Slider::new(&mut self.db_range, DB_RANGE_RANGE)
-                    .logarithmic(true)
-                    .suffix(" dB")
-                    .max_decimals(1),
-            )
-            .on_hover_text(OVERLAY_HELP)
-            .changed();
-
-        ui.add_space(GAP);
-        ui.checkbox(&mut self.peaks.enabled, "Tracks")
+    /// Track dots and the thresholds that decide which tracks are shown
+    fn source_controls(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.peaks.enabled, "Show sources")
             .on_hover_text(format!(
                 "Dots at the tracked sources: local maxima of the map within {} dB of the \
-                 loudest point, at least {} grid cells apart, at most {}, from whose direction \
-                 at least {} dB more power arrives coherently than from any direction in silence \
-                 (the noise floor, learned from the quietest map of the last minute; a steady \
-                 background source is part of it), \
-                 followed from map to map. A dot appears after {} maps in a row and stays up to \
-                 {} maps after its peak is gone. Green: the audio from its direction is \
-                 classified as speech. The label is the track number, the level relative to \
-                 the loudest point and the speech probability; hover over a dot for its \
-                 coherence above the noise floor and above 2 kHz.",
+                 loudest point, at least {} grid cells apart and not on the image border \
+                 (sources outside the image end up there), at most {}, central ones first. A dot \
+                 appears once its maximum was found in {} of {} maps within {} grid cells, and \
+                 only if the source is loud and coherent enough (the two sliders below). Green: \
+                 the audio from its direction is classified as speech. Hover over a dot for \
+                 its values.",
                 self.peaks.range_db,
                 self.peaks.min_dist_cells,
                 self.peaks.max_count,
-                self.peaks.min_above_floor_db,
                 self.tracking.min_hits,
-                self.tracking.max_missed
+                self.tracking.confirm_window,
+                self.tracking.max_dist_cells,
             ));
+        if !self.peaks.enabled {
+            return;
+        }
 
-        if self.peaks.enabled {
-            let source_help = "How much louder (coherent power from its direction) a source \
-                must be than the quietest moment of the last minute to get a dot. Lower it if \
-                a talker gets no dot, raise it if dots appear on nothing. Applies immediately.";
-            label(ui, "Above floor").on_hover_text(source_help);
+        let floor_help = format!(
+            "How much louder (coherent power from its direction) a source must be than the \
+             quietest moment of the last minute to get a dot. Toward the image border it needs \
+             up to {} dB more (the array resolves best in the center). Lower it if a talker \
+             gets no dot, raise it if dots appear on nothing.",
+            self.peaks.center_weight_db
+        );
+        ui.horizontal(|ui| {
+            label(ui, "Above floor").on_hover_text(&floor_help);
             ui.add(
                 Slider::new(&mut self.peaks.min_above_floor_db, SOURCE_RANGE)
                     .suffix(" dB")
                     .max_decimals(0),
             )
-            .on_hover_text(source_help);
-        }
+            .on_hover_text(&floor_help);
+        });
 
-        ui.add_space(GAP);
+        let coherence_help = "How much of the sound above 2 kHz must arrive coherently from the \
+            source's direction. A point source or a snap reaches about 0 dB, diffuse room noise \
+            and mic noise stay far below, whatever their level. Raise it if dots appear on noise, \
+            lower it if real sources get none.";
+        ui.horizontal(|ui| {
+            label(ui, "Coherence").on_hover_text(coherence_help);
+            ui.add(
+                Slider::new(&mut self.peaks.min_coherence_db, COHERENCE_RANGE)
+                    .suffix(" dB")
+                    .max_decimals(0),
+            )
+            .on_hover_text(coherence_help);
+        });
+    }
+
+    /// Speech classification on/off and its threshold (no pipeline restart)
+    fn speech_controls(&mut self, ui: &mut egui::Ui) {
         let speech_help = "Classify the audio from each track as speech (green dot). Off: no \
             classifier runs.";
         if ui
-            .checkbox(&mut self.speech_enabled, "Speech")
+            .checkbox(&mut self.speech_enabled, "Detect speech")
             .on_hover_text(speech_help)
             .changed()
         {
             self.shared_speech_enabled
                 .store(self.speech_enabled, Ordering::Relaxed);
         }
-        if self.speech_enabled {
-            let help = "Speech probability (smoothed) at which a track turns green. It stays \
-                green for speech.hold_ms after the last time the probability was this high. Raise \
-                it if noise or music turns green, lower it if speech stays blue. Applies \
-                immediately.";
+        if !self.speech_enabled {
+            return;
+        }
+        let help = "Speech probability (smoothed) at which a track turns green. It stays green \
+            for speech.hold_ms after the last time the probability was this high. Raise it if \
+            noise or music turns green, lower it if speech stays blue.";
+        ui.horizontal(|ui| {
+            label(ui, "Threshold").on_hover_text(help);
             let changed = ui
                 .add(
                     Slider::new(
@@ -569,14 +680,64 @@ impl App {
                 self.shared_speech_threshold
                     .store(self.speech_threshold.to_bits(), Ordering::Relaxed);
             }
+        });
+    }
+
+    /// Camera dropdown: "Auto" (first camera matching `camera.name`) or one listed camera, by
+    /// name (survives replugging), plus the measured format. The field of view in the config
+    /// belongs to the configured camera, so the overlay only fits other cameras with the same
+    /// field of view.
+    fn camera_control(&self, ui: &mut egui::Ui) {
+        let mut names: Vec<String> = self
+            .camera
+            .cameras
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        // One entry per name: a camera can show up several times (V4L2 metadata node)
+        names.dedup();
+        let current = self.camera.choice.lock().unwrap().clone();
+        let auto_label = format!("Auto ({})", self.camera_name);
+        let selected_text = match &current {
+            CameraChoice::Auto => auto_label.clone(),
+            CameraChoice::Name(name) => name.clone(),
+        };
+
+        let mut choice = current.clone();
+        egui::ComboBox::from_id_salt("camera")
+            .selected_text(selected_text)
+            .width(CAMERA_COMBO_WIDTH)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, CameraChoice::Auto, auto_label);
+                for name in names {
+                    let label = name.clone();
+                    ui.selectable_value(&mut choice, CameraChoice::Name(name), label);
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "Auto opens the first camera whose name contains \"{}\" (camera.name). The \
+                 overlay only lines up with cameras that match the configured field of view or \
+                 calibration.",
+                self.camera_name
+            ));
+
+        let measured = self.camera.measured.lock().unwrap().clone();
+        if !measured.is_empty() {
+            label(ui, &measured);
         }
-        db_range_changed
+
+        if choice != current {
+            *self.camera.choice.lock().unwrap() = choice;
+            set_status(ui.ctx(), &self.camera.status, DeviceStatus::Opening);
+        }
     }
 }
 
-/// Dot with id and level per confirmed track at least `min_above_floor_db` above the noise
-/// floor, with its coherence details while the pointer (`hover`) is on the dot; `rect` is where
-/// the map is drawn, `size` its grid size
+/// Dot with id and level per shown track (see `Track::shown`), with its values while the pointer
+/// (`hover`) is on the dot; `rect` is where the map is drawn, `size` its grid size
 fn draw_tracks(
     painter: &egui::Painter,
     rect: Rect,
@@ -584,14 +745,12 @@ fn draw_tracks(
     tracks: &[Track],
     speech: &HashMap<u64, SpeechStatus>,
     hover: Option<Pos2>,
-    min_above_floor_db: f64,
+    peaks: &PeakConfig,
 ) {
     let radius = (MARKER_RADIUS * rect.height()).max(MARKER_RADIUS_MIN);
     let font = FontId::proportional((MARKER_FONT * rect.height()).max(MARKER_FONT_MIN));
     let shade = Color32::from_black_alpha(170);
-    let shown = tracks
-        .iter()
-        .filter(|track| track.confirmed && track.source_db >= min_above_floor_db);
+    let shown = tracks.iter().filter(|track| track.shown(peaks));
     for track in shown {
         // Grid cell centers at (col + 0.5) / width of the image
         let x = rect.left() + (track.col as f32 + 0.5) / width as f32 * rect.width();
@@ -608,7 +767,12 @@ fn draw_tracks(
                 1.9 * radius,
                 Stroke::new(0.25 * radius, theme::SPEECH.gamma_multiply(0.5)),
             );
-            painter.circle(center, 1.3 * radius, theme::SPEECH, Stroke::new(2.0, Color32::WHITE));
+            painter.circle(
+                center,
+                1.3 * radius,
+                theme::SPEECH,
+                Stroke::new(2.0, Color32::WHITE),
+            );
             1.9 * radius
         } else {
             painter.circle_filled(center, radius, shade);
@@ -627,8 +791,10 @@ fn draw_tracks(
         }
         if hover.is_some_and(|pos| pos.distance(center) <= 2.0 * radius) {
             text += &format!(
-                "  |  {:+.0} dB above the noise floor, {:.0} dB coherent above 2 kHz{}",
+                "  |  {:+.0} dB above the noise floor (needs {:.0}), {:.0} dB coherent above \
+                 2 kHz{}",
                 track.source_db,
+                peaks.min_above_floor_db + track.edge_penalty_db,
                 track.source_upper_db,
                 if track.steady { "" } else { ", impulsive" }
             );
@@ -655,7 +821,10 @@ fn draw_tracks(
 /// the values to its right. A drag or click moves the nearer handle; each end stays
 /// `MIN_BAND_HZ` from the other.
 fn band_slider(ui: &mut egui::Ui, f_lo: &mut f64, f_hi: &mut f64) -> egui::Response {
-    let size = vec2(BAND_RAIL_WIDTH + BAND_TEXT_WIDTH, ui.spacing().interact_size.y);
+    let size = vec2(
+        BAND_RAIL_WIDTH + BAND_TEXT_WIDTH,
+        ui.spacing().interact_size.y,
+    );
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let rail = Rect::from_x_y_ranges(
         rect.left() + HANDLE_RADIUS..=rect.left() + BAND_RAIL_WIDTH - HANDLE_RADIUS,
@@ -676,7 +845,9 @@ fn band_slider(ui: &mut egui::Ui, f_lo: &mut f64, f_hi: &mut f64) -> egui::Respo
             ui.data_mut(|data| data.insert_temp(handle_id, upper));
         }
         if response.dragged() || response.clicked() {
-            let upper = ui.data(|data| data.get_temp::<bool>(handle_id)).unwrap_or(false);
+            let upper = ui
+                .data(|data| data.get_temp::<bool>(handle_id))
+                .unwrap_or(false);
             let f = to_f(pos.x);
             if upper {
                 *f_hi = f.clamp(*f_lo + MIN_BAND_HZ, F_MAX_HZ);
@@ -693,7 +864,12 @@ fn band_slider(ui: &mut egui::Ui, f_lo: &mut f64, f_hi: &mut f64) -> egui::Respo
     painter.rect_filled(selected, 2.0, theme::ACCENT);
     for x in [x_lo, x_hi] {
         let center = pos2(x, rail.center().y);
-        painter.circle(center, HANDLE_RADIUS, Color32::WHITE, Stroke::new(1.0, theme::ACCENT));
+        painter.circle(
+            center,
+            HANDLE_RADIUS,
+            Color32::WHITE,
+            Stroke::new(1.0, theme::ACCENT),
+        );
     }
     painter.text(
         pos2(rect.left() + BAND_RAIL_WIDTH + 6.0, rect.center().y),
@@ -703,6 +879,11 @@ fn band_slider(ui: &mut egui::Ui, f_lo: &mut f64, f_hi: &mut f64) -> egui::Respo
         theme::TEXT,
     );
     response
+}
+
+/// Section title in the settings menu
+fn heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).strong());
 }
 
 /// Muted label in front of a control
@@ -721,8 +902,8 @@ fn set_status(ctx: &egui::Context, status: &Mutex<DeviceStatus>, new: DeviceStat
 enum CameraChoice {
     /// First camera whose name contains `camera.name` from the config
     Auto,
-    /// Camera with this index, see `CameraEntry`
-    Index(u32),
+    /// Camera with this name (chosen in the GUI; the name survives replugging, the index not)
+    Name(String),
 }
 
 /// Camera state shared between the GUI and the camera thread
@@ -733,6 +914,8 @@ struct CameraShared {
     status: Mutex<DeviceStatus>,
     /// Cameras for the dropdown; refreshed by the thread on every open attempt
     cameras: Mutex<Vec<CameraEntry>>,
+    /// Delivered frame size and rate, e.g. "1920x1080, 30 fps"; updated about once a second
+    measured: Mutex<String>,
 }
 
 /// Width of the camera dropdown; camera names are long
@@ -763,7 +946,7 @@ fn spawn_camera(
             let (width, height, fps) = (config.width, config.height, config.fps);
             let camera = match &choice {
                 CameraChoice::Auto => CameraSource::open_by_name(&config.name, width, height, fps),
-                CameraChoice::Index(index) => CameraSource::new(*index, width, height, fps),
+                CameraChoice::Name(name) => CameraSource::open_by_name(name, width, height, fps),
             };
             let mut camera = match camera {
                 Ok(camera) => {
@@ -780,6 +963,7 @@ fn spawn_camera(
             let mut failed = 0;
             let mut last_error = String::new();
             let mut size_checked = false;
+            let mut rate = FrameRate::new();
             while failed < CAMERA_MAX_FAILED_FRAMES {
                 // Another camera selected: drop this one (end of the loop body), then open it
                 if *shared.choice.lock().unwrap() != choice {
@@ -794,6 +978,10 @@ fn spawn_camera(
                     }
                 };
                 failed = 0;
+                if let Some(fps) = rate.frame() {
+                    *shared.measured.lock().unwrap() =
+                        format!("{}x{}, {fps:.0} fps", frame.width, frame.height);
+                }
                 // The overlay is stretched over the frame; intrinsics only fit the configured size
                 if !size_checked {
                     size_checked = true;
@@ -818,6 +1006,36 @@ fn spawn_camera(
     });
 
     rx
+}
+
+/// Frames per second, measured over about `FRAME_RATE_WINDOW`
+struct FrameRate {
+    start: Instant,
+    frames: u32,
+}
+
+/// Interval of the measured frame rate
+const FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
+
+impl FrameRate {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            frames: 0,
+        }
+    }
+
+    /// Count a frame; the rate once per window, else `None`
+    fn frame(&mut self) -> Option<f64> {
+        self.frames += 1;
+        let elapsed = self.start.elapsed();
+        if elapsed < FRAME_RATE_WINDOW {
+            return None;
+        }
+        let fps = f64::from(self.frames) / elapsed.as_secs_f64();
+        *self = Self::new();
+        Some(fps)
+    }
 }
 
 /// Sleep up to `timeout`, but return as soon as the GUI selects another camera than `current`
@@ -879,53 +1097,53 @@ fn spawn_audio(
                               layout: &MapLayout,
                               tracks: &[Track]|
                  -> Result<ControlFlow<()>, BoxError> {
-                        let enabled = speech_enabled.load(Ordering::Relaxed);
-                        if enabled && speech.is_none() && !speech_failed {
-                            speech = SpeechDetector::load(&config.speech)
-                                .inspect_err(|e| eprintln!("No speech detection: {e}"))
-                                .ok();
-                            speech_failed = speech.is_none();
+                    let enabled = speech_enabled.load(Ordering::Relaxed);
+                    if enabled && speech.is_none() && !speech_failed {
+                        speech = SpeechDetector::load(&config.speech)
+                            .inspect_err(|e| eprintln!("No speech detection: {e}"))
+                            .ok();
+                        speech_failed = speech.is_none();
+                    }
+                    let speech = match &mut speech {
+                        Some(detector) if enabled => {
+                            let threshold = speech_threshold.load(Ordering::Relaxed);
+                            detector.set_on_threshold(f32::from_bits(threshold));
+                            detector.update(tracks)?;
+                            detector.statuses()
                         }
-                        let speech = match &mut speech {
-                            Some(detector) if enabled => {
-                                let threshold = speech_threshold.load(Ordering::Relaxed);
-                                detector.set_on_threshold(f32::from_bits(threshold));
-                                detector.update(tracks)?;
-                                detector.statuses()
-                            }
-                            // Off: forget the tracks, so that turning it on starts fresh
-                            Some(detector) => {
-                                detector.reset();
-                                HashMap::new()
-                            }
-                            None => HashMap::new(),
-                        };
-                        let tracks = tracks
-                            .iter()
-                            .map(|track| Track {
-                                samples: Vec::new(),
-                                ..track.clone()
-                            })
-                            .collect();
-                        let map = MapData {
-                            size: [layout.grid_width, layout.grid_height],
-                            power: power.to_vec(),
-                            tracks,
-                            speech,
-                        };
-                        match tx.try_send(map) {
-                            Ok(()) => ctx.request_repaint(),
-                            Err(TrySendError::Full(_)) => {}
-                            Err(TrySendError::Disconnected(_)) => {
-                                gui_closed = true;
-                                return Ok(ControlFlow::Break(()));
-                            }
+                        // Off: forget the tracks, so that turning it on starts fresh
+                        Some(detector) => {
+                            detector.reset();
+                            HashMap::new()
                         }
-                        if *settings.lock().unwrap() != current {
+                        None => HashMap::new(),
+                    };
+                    let tracks = tracks
+                        .iter()
+                        .map(|track| Track {
+                            samples: Vec::new(),
+                            ..track.clone()
+                        })
+                        .collect();
+                    let map = MapData {
+                        size: [layout.grid_width, layout.grid_height],
+                        power: power.to_vec(),
+                        tracks,
+                        speech,
+                    };
+                    match tx.try_send(map) {
+                        Ok(()) => ctx.request_repaint(),
+                        Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => {
+                            gui_closed = true;
                             return Ok(ControlFlow::Break(()));
                         }
-                        Ok(ControlFlow::Continue(()))
-                    };
+                    }
+                    if *settings.lock().unwrap() != current {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                };
 
                 let result = run_configured(&mut mic, sample_rate, &config, on_map);
 

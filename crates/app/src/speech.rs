@@ -90,7 +90,9 @@ impl SpeechConfig {
             return Err("speech.echo_correlation must be >= 0".to_string());
         }
         if !self.echo_margin_db.is_finite() || self.min_source_db.is_nan() {
-            return Err("speech: echo_margin_db must be finite, min_source_db a number".to_string());
+            return Err(
+                "speech: echo_margin_db must be finite, min_source_db a number".to_string(),
+            );
         }
         Ok(())
     }
@@ -300,7 +302,9 @@ impl SpeechDetector {
                 state
                     .hysteresis
                     .update(probability, rms, [track.col, track.row], &params);
-                state.frames.push_back((probability.clamp(0.0, 1.0), rms * rms));
+                state
+                    .frames
+                    .push_back((probability.clamp(0.0, 1.0), rms * rms));
             }
             let excess = state.frames.len().saturating_sub(ECHO_WINDOW / HOP);
             state.frames.drain(..excess);
@@ -358,7 +362,10 @@ impl SpeechDetector {
             })
             .map(|(other, _)| {
                 let other_recent = &self.tracks[&other.id].recent;
-                (other.id, max_correlation(&state.recent, other_recent, ECHO_MAX_LAG))
+                (
+                    other.id,
+                    max_correlation(&state.recent, other_recent, ECHO_MAX_LAG),
+                )
             })
             .filter(|&(_, correlation)| correlation >= self.config.echo_correlation)
             .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -394,10 +401,18 @@ fn max_correlation(a: &[f32], b: &[f32], max_lag: usize) -> f64 {
     }
     let max_lag = max_lag.min(len.saturating_sub(1));
     let dot = |x: &[f32], y: &[f32]| -> f64 {
-        x.iter().zip(y).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum()
+        x.iter()
+            .zip(y)
+            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+            .sum()
     };
     (0..=max_lag)
-        .flat_map(|lag| [dot(&a[..len - lag], &b[lag..]), dot(&a[lag..], &b[..len - lag])])
+        .flat_map(|lag| {
+            [
+                dot(&a[..len - lag], &b[lag..]),
+                dot(&a[lag..], &b[..len - lag]),
+            ]
+        })
         .map(f64::abs)
         .fold(0.0, f64::max)
         / norm
@@ -413,8 +428,11 @@ mod test {
 
     fn config() -> SpeechConfig {
         SpeechConfig {
-            model: concat!(env!("CARGO_MANIFEST_DIR"), "/../../model/speech_detector.json")
-                .to_string(),
+            model: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../model/speech_detector.json"
+            )
+            .to_string(),
             // The test signals are at microphone level already
             gain_db: 0.0,
             ..SpeechConfig::default()
@@ -435,8 +453,10 @@ mod test {
             level_db,
             source_db: 0.0,
             source_upper_db: 0.0,
+            edge_penalty_db: 0.0,
             steady: true,
             hits: 1,
+            recent: 1,
             missed: 0,
             confirmed: true,
             samples: samples.to_vec(),
@@ -515,7 +535,10 @@ mod test {
         assert_eq!(params.hold_frames, 50);
 
         let mut state = Hysteresis::default();
-        assert!(!feed(&mut state, &params, 0.6, 1000.0), "below on_threshold");
+        assert!(
+            !feed(&mut state, &params, 0.6, 1000.0),
+            "below on_threshold"
+        );
         assert!(feed(&mut state, &params, 1.0, 500.0));
         assert!(feed(&mut state, &params, 0.2, 400.0), "held at 0.2");
         // Syllables and pauses
@@ -524,13 +547,25 @@ mod test {
             assert!(feed(&mut state, &params, 0.05, 250.0));
         }
         assert!(feed(&mut state, &params, 0.9, 150.0));
-        assert!(feed(&mut state, &params, 0.0, 400.0), "held during the pause");
-        assert!(!feed(&mut state, &params, 0.0, 200.0), "ended after hold_ms");
+        assert!(
+            feed(&mut state, &params, 0.0, 400.0),
+            "held during the pause"
+        );
+        assert!(
+            !feed(&mut state, &params, 0.0, 200.0),
+            "ended after hold_ms"
+        );
 
         // Clapping after speech: about 0.45, never on_threshold
         assert!(feed(&mut state, &params, 1.0, 500.0));
-        assert!(feed(&mut state, &params, 0.45, 400.0), "held after the speech");
-        assert!(!feed(&mut state, &params, 0.45, 200.0), "a 0.45 sound does not keep it");
+        assert!(
+            feed(&mut state, &params, 0.45, 400.0),
+            "held after the speech"
+        );
+        assert!(
+            !feed(&mut state, &params, 0.45, 200.0),
+            "a 0.45 sound does not keep it"
+        );
 
         let mut quiet = Hysteresis::default();
         for _ in 0..50 {
@@ -546,10 +581,16 @@ mod test {
         let params = HysteresisParams::new(&hysteresis_config());
         let mut state = Hysteresis::default();
         assert!(feed_at(&mut state, &params, 1.0, 500.0, [10.0, 10.0]));
-        assert!(feed_at(&mut state, &params, 0.3, 200.0, [11.5, 11.0]), "within 3 cells");
+        assert!(
+            feed_at(&mut state, &params, 0.3, 200.0, [11.5, 11.0]),
+            "within 3 cells"
+        );
         // Speech at the new position re-anchors
         assert!(feed_at(&mut state, &params, 1.0, 200.0, [12.0, 11.0]));
-        assert!(!feed_at(&mut state, &params, 0.3, 20.0, [16.0, 11.0]), "snapping 4 cells away");
+        assert!(
+            !feed_at(&mut state, &params, 0.3, 20.0, [16.0, 11.0]),
+            "snapping 4 cells away"
+        );
     }
 
     /// Bursts shorter than the onset (snapping, clapping) do not start speech, a syllable does.
@@ -571,7 +612,11 @@ mod test {
         let other = noise(4800, 2, 0.1);
         let mut copy = vec![0.0; 120];
         copy.extend(original[..4800 - 120].iter().map(|v| 0.3 * v));
-        let copy: Vec<f32> = copy.iter().zip(noise(4800, 3, 0.01)).map(|(c, n)| c + n).collect();
+        let copy: Vec<f32> = copy
+            .iter()
+            .zip(noise(4800, 3, 0.01))
+            .map(|(c, n)| c + n)
+            .collect();
 
         let echo = max_correlation(&copy, &original, 320);
         let independent = max_correlation(&other, &original, 320);
@@ -604,7 +649,10 @@ mod test {
             echo_maps += usize::from(echo.echo_of == Some(0));
             maps += 1;
         }
-        assert!(speaker_maps > maps / 2, "speaker is speech in {speaker_maps} of {maps} maps");
+        assert!(
+            speaker_maps > maps / 2,
+            "speaker is speech in {speaker_maps} of {maps} maps"
+        );
         assert!(echo_maps > 0, "the reflection was never speech-like");
     }
 
@@ -621,8 +669,16 @@ mod test {
             .enumerate()
             .map(|(n, v)| 0.5 * (-((n % 4800) as f32) / 128.0).exp() * v)
             .collect();
-        let speaker: Vec<f32> = speech.iter().zip(&snaps).map(|(s, k)| s + 0.3 * k).collect();
-        let snapping: Vec<f32> = speech.iter().zip(&snaps).map(|(s, k)| 0.1 * s + k).collect();
+        let speaker: Vec<f32> = speech
+            .iter()
+            .zip(&snaps)
+            .map(|(s, k)| s + 0.3 * k)
+            .collect();
+        let snapping: Vec<f32> = speech
+            .iter()
+            .zip(&snaps)
+            .map(|(s, k)| 0.1 * s + k)
+            .collect();
 
         let mut detector = SpeechDetector::load(&config()).unwrap();
         let (mut speaker_maps, mut snapping_maps, mut maps) = (0, 0, 0);
@@ -637,9 +693,15 @@ mod test {
             snapping_maps += usize::from(detector.status(1).unwrap_or_default().speech);
             maps += 1;
         }
-        assert!(speaker_maps > maps / 2, "speaker is speech in {speaker_maps} of {maps} maps");
+        assert!(
+            speaker_maps > maps / 2,
+            "speaker is speech in {speaker_maps} of {maps} maps"
+        );
         // The speech leaking into the snapping track is an echo of the speaker
-        assert_eq!(snapping_maps, 0, "snapping is speech in {snapping_maps} of {maps} maps");
+        assert_eq!(
+            snapping_maps, 0,
+            "snapping is speech in {snapping_maps} of {maps} maps"
+        );
     }
 
     /// Two talkers at the same level, each leaking into the other's beam, both stay speech.
@@ -648,10 +710,23 @@ mod test {
         let speech = speech_fixture();
         // The second talker says the same text 1.3 s later (independent signal)
         let offset = 20_800;
-        let other: Vec<f32> =
-            speech.iter().cycle().skip(offset).take(speech.len()).copied().collect();
-        let a: Vec<f32> = speech.iter().zip(&other).map(|(s, o)| s + 0.3 * o).collect();
-        let b: Vec<f32> = other.iter().zip(&speech).map(|(o, s)| o + 0.3 * s).collect();
+        let other: Vec<f32> = speech
+            .iter()
+            .cycle()
+            .skip(offset)
+            .take(speech.len())
+            .copied()
+            .collect();
+        let a: Vec<f32> = speech
+            .iter()
+            .zip(&other)
+            .map(|(s, o)| s + 0.3 * o)
+            .collect();
+        let b: Vec<f32> = other
+            .iter()
+            .zip(&speech)
+            .map(|(o, s)| o + 0.3 * s)
+            .collect();
 
         let mut detector = SpeechDetector::load(&config()).unwrap();
         let mut together = [0, 0];
@@ -698,7 +773,11 @@ mod test {
     fn speech_fixture_is_speech() {
         let flags = speech_per_map(&speech_fixture());
         let speech = flags.iter().filter(|&&s| s).count();
-        assert!(speech > flags.len() / 2, "speech in {speech} of {} maps", flags.len());
+        assert!(
+            speech > flags.len() / 2,
+            "speech in {speech} of {} maps",
+            flags.len()
+        );
     }
 
     /// White noise and a steady tone at speech level are not speech.

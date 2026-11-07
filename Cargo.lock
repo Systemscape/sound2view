@@ -5428,6 +5428,7 @@ dependencies = [
  "eframe 0.37.0",
  "hound",
  "image",
+ "rayon",
  "serde",
  "sound2view-core",
  "toml",
